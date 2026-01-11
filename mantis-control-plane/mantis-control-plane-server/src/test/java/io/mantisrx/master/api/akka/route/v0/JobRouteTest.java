@@ -60,7 +60,6 @@ import io.mantisrx.master.api.akka.route.handlers.JobStatusRouteHandler;
 import io.mantisrx.master.api.akka.route.handlers.ResourceClusterRouteHandler;
 import io.mantisrx.master.api.akka.route.proto.JobClusterProtoAdapter;
 import io.mantisrx.master.api.akka.route.v1.AdminMasterRoute;
-import io.mantisrx.master.api.akka.route.v1.AgentClustersRoute;
 import io.mantisrx.master.api.akka.route.v1.JobArtifactsRoute;
 import io.mantisrx.master.api.akka.route.v1.JobClustersRoute;
 import io.mantisrx.master.api.akka.route.v1.JobDiscoveryStreamRoute;
@@ -77,9 +76,10 @@ import io.mantisrx.master.jobcluster.job.JobTestHelper;
 import io.mantisrx.master.jobcluster.job.MantisJobMetadataView;
 import io.mantisrx.master.jobcluster.proto.JobClusterManagerProto;
 import io.mantisrx.master.scheduler.FakeMantisScheduler;
-import io.mantisrx.master.vm.AgentClusterOperations;
 import io.mantisrx.runtime.MantisJobDurationType;
 import io.mantisrx.runtime.MantisJobState;
+import io.mantisrx.runtime.descriptor.JobScalingRule;
+import io.mantisrx.server.core.JobScalerRuleInfo;
 import io.mantisrx.server.core.JobSchedulingInfo;
 import io.mantisrx.server.core.NamedJobInfo;
 import io.mantisrx.server.core.WorkerAssignments;
@@ -202,7 +202,8 @@ public class JobRouteTest {
                     JobClustersManagerActor.props(
                         new MantisJobStore(new FileBasedPersistenceProvider(true)),
                         lifecycleEventPublisher,
-                        CostsCalculator.noop()),
+                        CostsCalculator.noop(),
+                        0),
                     "jobClustersManager");
 
                 MantisSchedulerFactory fakeSchedulerFactory = mock(MantisSchedulerFactory.class);
@@ -257,12 +258,7 @@ public class JobRouteTest {
                 final JobStatusRouteHandler jobStatusRouteHandler = mock(JobStatusRouteHandler.class);
                 when(jobStatusRouteHandler.jobStatus(anyString())).thenReturn(Flow.create());
                 final JobStatusRoute v0JobStatusRoute = new JobStatusRoute(jobStatusRouteHandler);
-                final AgentClusterOperations mockAgentClusterOps = mock(AgentClusterOperations.class);
-                final AgentClusterRoute v0AgentClusterRoute = new AgentClusterRoute(
-                        mockAgentClusterOps,
-                        system);
-                final AgentClustersRoute v1AgentClusterRoute = new AgentClustersRoute(
-                        mockAgentClusterOps);
+
                 final JobDiscoveryStreamRoute v1JobDiscoveryStreamRoute = new JobDiscoveryStreamRoute(jobDiscoveryRouteHandler);
                 final LastSubmittedJobIdStreamRoute v1LastSubmittedJobIdStreamRoute = new LastSubmittedJobIdStreamRoute(jobDiscoveryRouteHandler);
                 final JobStatusStreamRoute v1JobStatusStreamRoute = new JobStatusStreamRoute(jobStatusRouteHandler);
@@ -283,12 +279,10 @@ public class JobRouteTest {
                         v0JobRoute,
                         v0JobDiscoveryRoute,
                         v0JobStatusRoute,
-                        v0AgentClusterRoute,
                         v1JobClusterRoute,
                         v1JobsRoute,
                         v1JobArtifactsRoute,
                         v1AdminMasterRoute,
-                        v1AgentClusterRoute,
                         v1JobDiscoveryStreamRoute,
                         v1LastSubmittedJobIdStreamRoute,
                         v1JobStatusStreamRoute,
@@ -668,6 +662,35 @@ public class JobRouteTest {
     }
 
     @Test(dependsOnMethods = {"testSchedulingInfo"})
+    public void testScalerRuleInfo() throws InterruptedException {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String jobId = "sine-function-1";
+        Observable<JobScalerRuleInfo> jobScalerRuleInfoObservable = mantisClient.ruleInfoStream(jobId);
+        jobScalerRuleInfoObservable
+            .map(scalerRuleInfo -> {
+                logger.info("scalerRuleInfo {}", scalerRuleInfo);
+                try {
+                    assertEquals(jobId, scalerRuleInfo.getJobId());
+                    List<JobScalingRule> rules = scalerRuleInfo.getRules();
+                    assertEquals(0, rules.size());
+                } catch (Exception e) {
+                    logger.error("caught exception", e);
+                    org.testng.Assert.fail(
+                        "testScalerRuleInfo test failed with exception " + e.getMessage(),
+                        e);
+                }
+                latch.countDown();
+                return scalerRuleInfo;
+            })
+            .take(1)
+            .doOnError(t -> logger.warn("onError", t))
+            .doOnCompleted(() -> logger.info("onCompleted"))
+            .doAfterTerminate(() -> latch.countDown())
+            .subscribe();
+        assertTrue(latch.await(10, TimeUnit.SECONDS));
+    }
+
+    @Test(dependsOnMethods = {"testScalerRuleInfo"})
     public void testJobResubmitWorker() throws InterruptedException {
         Thread.sleep(3000);
         final CountDownLatch latch = new CountDownLatch(1);

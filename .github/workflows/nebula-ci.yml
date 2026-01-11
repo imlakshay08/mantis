@@ -12,23 +12,29 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # test against JDK 8
-        java: [ 8 ]
+        # test against JDK 17
+        java: [ 17 ]
     name: CI with Java ${{ matrix.java }}
     steps:
-      - uses: actions/checkout@v1
+      - name: Setup Git
+        run: |
+          git config --global user.name "Mantis OSS Maintainers"
+          git config --global user.email "mantis-oss-dev@googlegroups.com"
+      - uses: actions/checkout@v4
       - name: Setup jdk
         uses: actions/setup-java@v1
         with:
           java-version: ${{ matrix.java }}
-      - uses: actions/cache@v1
+      - name: Gradle Cache
+        uses: actions/cache@v4
         id: gradle-cache
         with:
           path: ~/.gradle/caches
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/gradle/dependency-locks/*.lockfile') }}
           restore-keys: |
             - ${{ runner.os }}-gradle-
-      - uses: actions/cache@v1
+      - name: Gradle Wrapper Cache
+        uses: actions/cache@v4
         id: gradle-wrapper-cache
         with:
           path: ~/.gradle/wrapper
@@ -36,7 +42,7 @@ jobs:
           restore-keys: |
             - ${{ runner.os }}-gradlewrapper-
       - name: Build with Gradle
-        run: ./gradlew --info --stacktrace build --warning-mode=all
+        run: ./gradlew --info --stacktrace build akkatest --warning-mode=all
         env:
           CI_NAME: github_actions
           CI_BUILD_NUMBER: ${{ github.sha }}
@@ -44,7 +50,7 @@ jobs:
           CI_BRANCH: ${{ github.ref }}
           COVERALLS_REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Upload Test Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: Unit Test Results
@@ -55,7 +61,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Upload
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v4
         with:
           name: Event File
           path: ${{ github.event_path }}

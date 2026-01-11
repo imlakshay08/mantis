@@ -22,8 +22,11 @@ import io.mantisrx.master.jobcluster.job.IMantisStageMetadata;
 import io.mantisrx.master.jobcluster.job.MantisStageMetadataImpl;
 import io.mantisrx.master.jobcluster.job.worker.IMantisWorkerMetadata;
 import io.mantisrx.master.jobcluster.job.worker.JobWorker;
+import io.mantisrx.master.jobcluster.scaler.IJobClusterScalerRuleData;
+import io.mantisrx.master.jobcluster.scaler.JobClusterScalerRule;
 import io.mantisrx.master.resourcecluster.DisableTaskExecutorsRequest;
 import io.mantisrx.server.core.domain.ArtifactID;
+import io.mantisrx.server.core.domain.JobArtifact;
 import io.mantisrx.server.master.config.ConfigurationProvider;
 import io.mantisrx.server.master.domain.JobClusterDefinitionImpl.CompletedJob;
 import io.mantisrx.server.master.domain.JobId;
@@ -131,6 +134,14 @@ public class MantisJobStore {
         storageProvider.deleteJob(jobId);
     }
 
+    public void updateJobClusterScalerRule(IJobClusterScalerRuleData scalerRuleData) throws Exception {
+        storageProvider.updateJobClusterScalerRule(scalerRuleData);
+    }
+
+    public IJobClusterScalerRuleData getJobClusterScalerData(String clusterName) throws IOException {
+        return storageProvider.getJobClusterScalerRuleData(clusterName);
+    }
+
     public void storeCompletedJobForCluster(String name, CompletedJob completedJob) throws IOException {
         storageProvider.storeCompletedJobForCluster(name, completedJob);
     }
@@ -232,7 +243,7 @@ public class MantisJobStore {
     public Optional<IMantisJobMetadata> getArchivedJob(final String jobId) {
         final Optional<IMantisJobMetadata> jobOp = Optional.ofNullable(archivedJobsMetadataCache.getJob(jobId));
         if (!jobOp.isPresent()) {
-            logger.error("archivedJobsMetadataCache found no job for job ID {}", jobId);
+            logger.debug("archivedJobsMetadataCache found no job for job ID {}", jobId);
         }
         return jobOp;
     }
@@ -275,6 +286,10 @@ public class MantisJobStore {
 
     public List<String> getJobArtifactsToCache(ClusterID clusterID) throws IOException {
         return storageProvider.listJobArtifactsToCache(clusterID);
+    }
+
+    public JobArtifact getJobArtifact(ArtifactID artifactID) throws IOException {
+        return storageProvider.getArtifactById(artifactID.getResourceID());
     }
 
     private static class TerminatedJob implements Comparable<TerminatedJob> {

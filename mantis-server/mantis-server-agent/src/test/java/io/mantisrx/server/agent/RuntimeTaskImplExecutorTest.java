@@ -17,7 +17,7 @@ package io.mantisrx.server.agent;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -139,6 +139,11 @@ public class RuntimeTaskImplExecutorTest {
         props.setProperty("mantis.localmode", "true");
         props.setProperty("mantis.zookeeper.connectString", "localhost:8100");
 
+        props.setProperty("mantis.taskexecutor.hardware.cpu-cores", "1.0");
+        props.setProperty("mantis.taskexecutor.hardware.memory-in-mb", "4096.0");
+        props.setProperty("mantis.taskexecutor.hardware.disk-in-mb", "10000.0");
+        props.setProperty("mantis.taskexecutor.hardware.network-bandwidth-in-mb", "1000.0");
+
         startedSignal = new CountDownLatch(1);
         doneSignal = new CountDownLatch(1);
         terminatedSignal = new CountDownLatch(1);
@@ -181,7 +186,7 @@ public class RuntimeTaskImplExecutorTest {
         this.localApiServer.stop(0);
     }
 
-    @Ignore
+    @Ignore // todo: this test is failing on CI.
     @Test
     public void testTaskExecutorEndToEndWithASingleStageJobByLoadingFromClassLoader()
         throws Exception {
@@ -213,7 +218,8 @@ public class RuntimeTaskImplExecutorTest {
                 1L,
                 new WorkerPorts(2, 3, 4, 5, 6),
                 Optional.of(SineFunctionJobProvider.class.getName()),
-                "user")), Time.seconds(1));
+                "user",
+                "111")), Time.seconds(1));
         wait.get();
         Assert.assertTrue(startedSignal.await(5, TimeUnit.SECONDS));
         Subscription subscription = HttpSources.source(HttpClientFactories.sseClientFactory(),

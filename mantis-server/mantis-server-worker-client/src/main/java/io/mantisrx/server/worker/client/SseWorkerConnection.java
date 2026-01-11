@@ -36,6 +36,7 @@ import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import mantis.io.reactivex.netty.metrics.MetricEventsListenerFactory;
 import mantis.io.reactivex.netty.pipeline.PipelineConfigurators;
 import mantis.io.reactivex.netty.protocol.http.client.HttpClient;
 import mantis.io.reactivex.netty.protocol.http.client.HttpClientBuilder;
@@ -55,6 +56,9 @@ public class SseWorkerConnection {
 
     private static final Logger logger = LoggerFactory.getLogger(SseWorkerConnection.class);
     private static final String metricNamePrefix = DROP_OPERATOR_INCOMING_METRIC_GROUP;
+
+    private static MetricEventsListenerFactory metricEventsListenerFactory;
+
     protected final PublishSubject<Boolean> shutdownSubject = PublishSubject.create();
     final AtomicLong lastDataReceived = new AtomicLong(System.currentTimeMillis());
     private final String connectionType;
@@ -94,11 +98,11 @@ public class SseWorkerConnection {
                                 @Override
                                 public Observable<?> call(Integer integer) {
                                     if (isShutdown) {
-                                        logger.info(getName() + ": Is shutdown, stopping retries");
+                                        logger.info("{}: Is shutdown, stopping retries", getName());
                                         return Observable.empty();
                                     }
                                     long delay = 2 * (integer > 10 ? 10 : integer);
-                                    logger.info(getName() + ": retrying conx after sleeping for " + delay + " secs");
+                                    logger.info("{}: retrying conx after sleeping for {} secs", getName(), delay);
                                     return Observable.timer(delay, TimeUnit.SECONDS);
                                 }
                             });
@@ -169,6 +173,10 @@ public class SseWorkerConnection {
         return false;
     }
 
+    public static void useMetricListenersFactory(MetricEventsListenerFactory factory) {
+        metricEventsListenerFactory = factory;
+    }
+
     public String getName() {
         return "Sse" + connectionType + "Connection: " + hostname + ":" + port;
     }
@@ -180,11 +188,16 @@ public class SseWorkerConnection {
         shutdownSubject.onNext(true);
         shutdownSubject.onCompleted();
         isShutdown = true;
-        resetConnected();
+        closeConnected();
     }
 
     private <I, O> HttpClientBuilder<I, O> newHttpClientBuilder(String host, int port) {
-        return new MantisHttpClientBuilder<I, O>(host, port).withMaxConnections(1000).enableWireLogging(LogLevel.DEBUG);
+        HttpClientBuilder<I, O> builder =
+            new MantisHttpClientBuilder<I, O>(host, port).withMaxConnections(1000).enableWireLogging(LogLevel.DEBUG);
+        if (null != metricEventsListenerFactory) {
+            builder.withMetricEventsListenerFactory(metricEventsListenerFactory);
+        }
+        return builder;
     }
 
     public synchronized Observable<MantisServerSentEvent> call() {
@@ -236,18 +249,34 @@ public class SseWorkerConnection {
                             return streamContent(response, updateDataRecvngStatus, dataRecvTimeoutSecs, delimiter);
                         })
                         .doOnError((Throwable throwable) -> {
+                            // Only reset connection status, do not close SSE http client.
+                            // otherwise it would cause infinite retry loop by the retryWhen below
                             resetConnected();
-                            logger.warn(getName() +
-                                    "Error on getting response from SSE server: " + throwable.getMessage());
+                            logger.warn("{}: Error on getting response from SSE server: {}",
+                                getName(), throwable.getMessage());
                             connectionResetHandler.call(throwable);
                         })
                         .retryWhen(retryLogic)
-                        .doOnCompleted(this::resetConnected);
+                        .doOnError((Throwable throwable) -> {
+                            closeConnected();
+                            logger.error("{}: non-retryable error on getting response from SSE server: ",
+                                getName(), throwable);
+                            connectionResetHandler.call(throwable);
+                        })
+                        .doOnCompleted(this::closeConnected);
+    }
+
+    /***
+     * close SSE connection status and close the SSE http client.
+     */
+    private void closeConnected() {
+        // explicitly close the connection
+        ((MantisHttpClientImpl<?, ?>)client).closeConn();
+        resetConnected();
     }
 
     private void resetConnected() {
-        // explicitly close the connection
-        ((MantisHttpClientImpl<?, ?>)client).closeConn();
+        ((MantisHttpClientImpl<?, ?>)client).resetConn();
         if (isConnected.getAndSet(false)) {
             if (updateConxStatus != null)
                 updateConxStatus.call(false);
@@ -291,8 +320,7 @@ public class SseWorkerConnection {
                     .subscribe();
         }
         return response.getContent()
-                .lift(new DropOperator<ServerSentEvent>(metricGroupId))
-                .flatMap((ServerSentEvent t1) -> {
+                .map((ServerSentEvent t1) -> {
                     lastDataReceived.set(System.currentTimeMillis());
                     if (isConnected.get() && isReceivingData.compareAndSet(false, true))
                         if (updateDataRecvngStatus != null)
@@ -301,10 +329,12 @@ public class SseWorkerConnection {
                             }
 
                     if (t1.hasEventType() && t1.getEventTypeAsString().startsWith("error:")) {
-                        return Observable.error(new SseException(ErrorType.Retryable, "Got error SSE event: " + t1.contentAsString()));
+                        throw new SseException(ErrorType.Retryable, "Got error SSE event: " + t1.contentAsString());
                     }
-                    return Observable.just(t1.contentAsString());
-                }, 1)
+                    return t1.contentAsString();
+                })
+                .lift(new DropOperator<String>(metricGroupId))
+                .rebatchRequests(this.bufferSize <= 0 ? 1 : this.bufferSize)
                 .filter(data -> {
                     if (data.startsWith("ping")) {
                         pingCounter.increment();

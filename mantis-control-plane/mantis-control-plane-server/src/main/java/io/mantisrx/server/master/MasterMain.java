@@ -22,9 +22,6 @@ import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
 import akka.actor.DeadLetter;
 import akka.actor.Props;
-import com.netflix.fenzo.AutoScaleAction;
-import com.netflix.fenzo.AutoScaleRule;
-import com.netflix.fenzo.VirtualMachineLease;
 import com.netflix.spectator.api.DefaultRegistry;
 import com.sampullara.cli.Args;
 import com.sampullara.cli.Argument;
@@ -33,7 +30,7 @@ import io.mantisrx.common.metrics.MetricsRegistry;
 import io.mantisrx.common.metrics.spectator.SpectatorRegistryFactory;
 import io.mantisrx.common.properties.DefaultMantisPropertiesLoader;
 import io.mantisrx.common.properties.MantisPropertiesLoader;
-import io.mantisrx.master.DeadLetterActor;
+import io.mantisrx.common.akka.DeadLetterActor;
 import io.mantisrx.master.JobClustersManagerActor;
 import io.mantisrx.master.JobClustersManagerService;
 import io.mantisrx.master.api.akka.MasterApiAkkaService;
@@ -52,25 +49,24 @@ import io.mantisrx.master.events.WorkerRegistryV2;
 import io.mantisrx.master.resourcecluster.ResourceClustersAkkaImpl;
 import io.mantisrx.master.resourcecluster.ResourceClustersHostManagerActor;
 import io.mantisrx.master.resourcecluster.resourceprovider.ResourceClusterProviderAdapter;
-import io.mantisrx.master.scheduler.AgentsErrorMonitorActor;
 import io.mantisrx.master.scheduler.JobMessageRouterImpl;
-import io.mantisrx.master.vm.AgentClusterOperationsImpl;
-import io.mantisrx.master.zk.LeaderElector;
+import io.mantisrx.master.zk.ZookeeperLeadershipFactory;
 import io.mantisrx.server.core.BaseService;
+import io.mantisrx.server.core.ILeaderElectorFactory;
+import io.mantisrx.server.core.ILeaderMonitorFactory;
+import io.mantisrx.server.core.ILeadershipManager;
 import io.mantisrx.server.core.MantisAkkaRpcSystemLoader;
 import io.mantisrx.server.core.Service;
-import io.mantisrx.server.core.json.DefaultObjectMapper;
-import io.mantisrx.server.core.master.LocalMasterMonitor;
+import io.mantisrx.server.core.master.LocalLeaderFactory;
 import io.mantisrx.server.core.master.MasterDescription;
+import io.mantisrx.server.core.master.MasterMonitor;
 import io.mantisrx.server.core.metrics.MetricsPublisherService;
 import io.mantisrx.server.core.metrics.MetricsServerService;
-import io.mantisrx.server.core.zookeeper.CuratorService;
+import io.mantisrx.server.core.utils.ConfigUtils;
 import io.mantisrx.server.master.config.ConfigurationFactory;
 import io.mantisrx.server.master.config.ConfigurationProvider;
 import io.mantisrx.server.master.config.MasterConfiguration;
 import io.mantisrx.server.master.config.StaticPropertiesConfigurationFactory;
-import io.mantisrx.server.master.mesos.MesosDriverSupplier;
-import io.mantisrx.server.master.mesos.VirtualMachineMasterServiceMesosImpl;
 import io.mantisrx.server.master.persistence.IMantisPersistenceProvider;
 import io.mantisrx.server.master.persistence.KeyValueBasedPersistenceProvider;
 import io.mantisrx.server.master.persistence.MantisJobStore;
@@ -78,24 +74,14 @@ import io.mantisrx.server.master.resourcecluster.ResourceClusters;
 import io.mantisrx.server.master.scheduler.JobMessageRouter;
 import io.mantisrx.server.master.scheduler.MantisSchedulerFactory;
 import io.mantisrx.server.master.scheduler.MantisSchedulerFactoryImpl;
-import io.mantisrx.server.master.scheduler.WorkerRegistry;
-import io.mantisrx.shaded.com.fasterxml.jackson.core.JsonProcessingException;
-import io.mantisrx.shaded.org.apache.curator.utils.ZKPaths;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.InputStream;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.Consumer;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.runtime.rpc.RpcService;
 import org.apache.flink.runtime.rpc.RpcSystem;
@@ -103,8 +89,6 @@ import org.apache.flink.runtime.rpc.RpcUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import rx.Observable;
-import rx.Observer;
-import rx.subjects.PublishSubject;
 
 
 public class MasterMain implements Service {
@@ -115,19 +99,15 @@ public class MasterMain implements Service {
     private final ServiceLifecycle mantisServices = new ServiceLifecycle();
     private final AtomicBoolean shutdownInitiated = new AtomicBoolean(false);
     private KeyValueBasedPersistenceProvider storageProvider;
-    private CountDownLatch blockUntilShutdown = new CountDownLatch(1);
-    private volatile CuratorService curatorService = null;
-    private volatile AgentClusterOperationsImpl agentClusterOps = null;
+    private final CountDownLatch blockUntilShutdown = new CountDownLatch(1);
     private MasterConfiguration config;
-    private SchedulingService schedulingService;
     private ILeadershipManager leadershipManager;
-    private final MantisPropertiesLoader dynamicPropertiesLoader;
+    private MasterMonitor monitor;
 
     public MasterMain(
         ConfigurationFactory configFactory,
         MantisPropertiesLoader dynamicPropertiesLoader,
         AuditEventSubscriber auditEventSubscriber) {
-        this.dynamicPropertiesLoader = dynamicPropertiesLoader;
         String test = "{\"jobId\":\"sine-function-1\",\"status\":{\"jobId\":\"sine-function-1\",\"stageNum\":1,\"workerIndex\":0,\"workerNumber\":2,\"type\":\"HEARTBEAT\",\"message\":\"heartbeat\",\"state\":\"Noop\",\"hostname\":null,\"timestamp\":1525813363585,\"reason\":\"Normal\",\"payloads\":[{\"type\":\"SubscriptionState\",\"data\":\"false\"},{\"type\":\"IncomingDataDrop\",\"data\":\"{\\\"onNextCount\\\":0,\\\"droppedCount\\\":0}\"}]}}";
 
         Metrics metrics = new Metrics.Builder()
@@ -139,15 +119,12 @@ public class MasterMain implements Service {
         try {
             ConfigurationProvider.initialize(configFactory);
             this.config = ConfigurationProvider.getConfig();
-            leadershipManager = new LeadershipManagerZkImpl(config, mantisServices);
+            leadershipManager = new LeadershipManagerImpl(config, mantisServices);
 
-            Thread t = new Thread(() -> shutdown());
+            Thread t = new Thread(this::shutdown);
             t.setDaemon(true);
             // shutdown hook
             Runtime.getRuntime().addShutdownHook(t);
-
-            // shared state
-            PublishSubject<String> vmLeaseRescindedSubject = PublishSubject.create();
 
             final ActorSystem system = ActorSystem.create("MantisMaster");
             // log the configuration of the actor system
@@ -157,8 +134,7 @@ public class MasterMain implements Service {
             final ActorRef actor = system.actorOf(Props.create(DeadLetterActor.class), "MantisDeadLetter");
             system.eventStream().subscribe(actor, DeadLetter.class);
 
-            ActorRef agentsErrorMonitorActor = system.actorOf(AgentsErrorMonitorActor.props(), "AgentsErrorMonitor");
-            ActorRef statusEventBrokerActor = system.actorOf(StatusEventBrokerActor.props(agentsErrorMonitorActor), "StatusEventBroker");
+            ActorRef statusEventBrokerActor = system.actorOf(StatusEventBrokerActor.props(), "StatusEventBroker");
             ActorRef auditEventBrokerActor = system.actorOf(AuditEventBrokerActor.props(auditEventSubscriber), "AuditEventBroker");
             final StatusEventSubscriber statusEventSubscriber = new StatusEventSubscriberAkkaImpl(statusEventBrokerActor);
             final AuditEventSubscriber auditEventSubscriberAkka = new AuditEventSubscriberAkkaImpl(auditEventBrokerActor);
@@ -176,7 +152,8 @@ public class MasterMain implements Service {
 
             storageProvider = new KeyValueBasedPersistenceProvider(this.config.getStorageProvider(), lifecycleEventPublisher);
             final MantisJobStore mantisJobStore = new MantisJobStore(storageProvider);
-            final ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(mantisJobStore, lifecycleEventPublisher, config.getJobCostsCalculator()), "JobClustersManager");
+
+            final ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(mantisJobStore, lifecycleEventPublisher, config.getJobCostsCalculator(), config.getSlaMaxHeadroomForAccepted()), "JobClustersManager");
             final JobMessageRouter jobMessageRouter = new JobMessageRouterImpl(jobClusterManagerActor);
 
             // Beginning of new stuff
@@ -203,42 +180,11 @@ public class MasterMain implements Service {
                     jobMessageRouter,
                     resourceClustersHostActor,
                     storageProvider,
-                    this.dynamicPropertiesLoader);
+                    dynamicPropertiesLoader);
 
             // end of new stuff
-            final WorkerRegistry workerRegistry = WorkerRegistryV2.INSTANCE;
-
-            if (config.getMesosEnabled()) {
-                final MesosDriverSupplier mesosDriverSupplier = new MesosDriverSupplier(this.config, vmLeaseRescindedSubject,
-                    jobMessageRouter,
-                    workerRegistry);
-
-                final VirtualMachineMasterServiceMesosImpl vmService = new VirtualMachineMasterServiceMesosImpl(
-                    this.config,
-                    getDescriptionJson(),
-                    mesosDriverSupplier);
-
-                schedulingService = new SchedulingService(jobMessageRouter, workerRegistry, vmLeaseRescindedSubject, vmService);
-
-
-                mesosDriverSupplier.setAddVMLeaseAction(schedulingService::addOffers);
-
-                // initialize agents error monitor
-                agentsErrorMonitorActor.tell(new AgentsErrorMonitorActor.InitializeAgentsErrorMonitor(schedulingService), ActorRef.noSender());
-                this.agentClusterOps = new AgentClusterOperationsImpl(storageProvider,
-                    jobMessageRouter,
-                    schedulingService,
-                    lifecycleEventPublisher,
-                    ConfigurationProvider.getConfig().getActiveSlaveAttributeName());
-
-                // services
-                mantisServices.addService(vmService);
-                mantisServices.addService(schedulingService);
-                mantisServices.addService(agentClusterOps);
-            }
-
             final MantisSchedulerFactory mantisSchedulerFactory =
-                new MantisSchedulerFactoryImpl(system, resourceClusters, new ExecuteStageRequestFactory(getConfig()), jobMessageRouter, schedulingService, getConfig(), MetricsRegistry.getInstance());
+                new MantisSchedulerFactoryImpl(system, resourceClusters, new ExecuteStageRequestFactory(getConfig()), jobMessageRouter, getConfig(), MetricsRegistry.getInstance());
 
             final boolean loadJobsFromStoreOnInit = true;
             final JobClustersManagerService jobClustersManagerService = new JobClustersManagerService(jobClusterManagerActor, mantisSchedulerFactory, loadJobsFromStoreOnInit);
@@ -253,17 +199,31 @@ public class MasterMain implements Service {
             // services
             mantisServices.addService(jobClustersManagerService);
 
-            if (this.config.isLocalMode()) {
-                mantisServices.addService(new MasterApiAkkaService(new LocalMasterMonitor(leadershipManager.getDescription()), leadershipManager.getDescription(), jobClusterManagerActor, statusEventBrokerActor,
-                       resourceClusters, resourceClustersHostActor, config.getApiPort(), storageProvider, lifecycleEventPublisher, leadershipManager, agentClusterOps));
-                leadershipManager.becomeLeader();
+            // set up leader election
+            final ILeaderElectorFactory leaderFactory;
+            final String fqcnLeaderFactory = config.getLeaderElectorFactory();
+            if(!config.isLocalMode() && ConfigUtils.createInstance(fqcnLeaderFactory, ILeaderElectorFactory.class) instanceof LocalLeaderFactory) {
+                logger.warn("local mode is {} and leader factory is {} this configuration is unsafe", config.isLocalMode(), config.getLeaderElectorFactory().getClass().getSimpleName());
+                final ZookeeperLeadershipFactory zkLeadership = new ZookeeperLeadershipFactory();
+                leaderFactory = zkLeadership;
+                monitor = zkLeadership.createLeaderMonitor(config);
+                logger.warn("using default non-local Zookeeper leader services you should set: "+
+                    "mantis.leader.elector.factory=io.mantisrx.master.zk.ZookeeperLeadershipFactory");
             } else {
-                curatorService = new CuratorService(this.config);
-                curatorService.start();
-                mantisServices.addService(createLeaderElector(curatorService, leadershipManager));
-                mantisServices.addService(new MasterApiAkkaService(curatorService.getMasterMonitor(), leadershipManager.getDescription(), jobClusterManagerActor, statusEventBrokerActor,
-                       resourceClusters, resourceClustersHostActor, config.getApiPort(), storageProvider, lifecycleEventPublisher, leadershipManager, agentClusterOps));
+                leaderFactory = ConfigUtils.createInstance(fqcnLeaderFactory, ILeaderElectorFactory.class);
+                monitor = ConfigUtils.createInstance(config.getLeaderMonitorFactoryName(), ILeaderMonitorFactory.class).createLeaderMonitor(config);
+                logger.warn("using leader factory {}", config.isLocalMode());
             }
+            monitor.start();
+            mantisServices.addService(leaderFactory.createLeaderElector(config, leadershipManager));
+            mantisServices.addService(new MasterApiAkkaService(monitor, leadershipManager.getDescription(), jobClusterManagerActor, statusEventBrokerActor,
+                resourceClusters, resourceClustersHostActor, config.getApiPort(), storageProvider, lifecycleEventPublisher, leadershipManager));
+
+            if (leaderFactory instanceof LocalLeaderFactory && !config.isLocalMode()) {
+                logger.error("local mode is [ {} ] and leader factory is {} this configuration is unsafe", config.isLocalMode(), leaderFactory.getClass().getSimpleName());
+                throw new RuntimeException("leader election is local but local mode is not enabled");
+            }
+
             m.getCounter("masterInitSuccess").increment();
         } catch (Exception e) {
             logger.error("caught exception on Mantis Master initialization", e);
@@ -271,98 +231,6 @@ public class MasterMain implements Service {
             shutdown();
             System.exit(1);
         }
-    }
-
-    private static Properties loadProperties(String propFile) {
-        // config
-        Properties props = new Properties();
-        try (InputStream in = findResourceAsStream(propFile)) {
-            props.load(in);
-        } catch (IOException e) {
-            throw new RuntimeException(String.format("Can't load properties from the given property file %s: %s", propFile, e.getMessage()), e);
-        }
-
-        for (String key : props.stringPropertyNames()) {
-            String envVarKey = key.toUpperCase().replace('.', '_');
-            String envValue = System.getenv(envVarKey);
-            if (envValue != null) {
-                props.setProperty(key, envValue);
-                logger.info("Override config from env {}: {}.", key, envValue);
-            }
-
-        }
-
-        return props;
-    }
-
-
-    /**
-     * Finds the given resource and returns its input stream. This method seeks the file first from the current working directory,
-     * and then in the class path.
-     *
-     * @param resourceName the name of the resource. It can either be a file name, or a path.
-     *
-     * @return An {@link java.io.InputStream} instance that represents the found resource. Null otherwise.
-     *
-     * @throws FileNotFoundException
-     */
-    private static InputStream findResourceAsStream(String resourceName) throws FileNotFoundException {
-        File resource = new File(resourceName);
-        if (resource.exists()) {
-            return new FileInputStream(resource);
-        }
-
-        InputStream is = Thread.currentThread().getContextClassLoader().getResourceAsStream(resourceName);
-        if (is == null) {
-            throw new FileNotFoundException(String.format("Can't find property file %s. Make sure the property file is either in your path or in your classpath ", resourceName));
-        }
-
-        return is;
-    }
-
-    private static void setupDummyAgentClusterAutoScaler() {
-        final AutoScaleRule dummyAutoScaleRule = new AutoScaleRule() {
-            @Override
-            public String getRuleName() {
-                return "test";
-            }
-
-            @Override
-            public int getMinIdleHostsToKeep() {
-                return 1;
-            }
-
-            @Override
-            public int getMaxIdleHostsToKeep() {
-                return 10;
-            }
-
-            @Override
-            public long getCoolDownSecs() {
-                return 300;
-            }
-
-            @Override
-            public boolean idleMachineTooSmall(VirtualMachineLease lease) {
-                return false;
-            }
-        };
-        AgentClustersAutoScaler.initialize(() -> new HashSet<>(Collections.singletonList(dummyAutoScaleRule)), new Observer<AutoScaleAction>() {
-            @Override
-            public void onCompleted() {
-
-            }
-
-            @Override
-            public void onError(Throwable e) {
-
-            }
-
-            @Override
-            public void onNext(AutoScaleAction autoScaleAction) {
-
-            }
-        });
     }
 
     public static void main(String[] args) {
@@ -378,9 +246,8 @@ public class MasterMain implements Service {
             Properties props = new Properties();
             props.putAll(System.getenv());
             props.putAll(System.getProperties());
-            props.putAll(loadProperties(propFile));
+            props.putAll(ConfigUtils.loadProperties(propFile));
             StaticPropertiesConfigurationFactory factory = new StaticPropertiesConfigurationFactory(props);
-            setupDummyAgentClusterAutoScaler();
             final AuditEventSubscriber auditEventSubscriber = new AuditEventSubscriberLoggingImpl();
             final MantisPropertiesLoader propertiesLoader = new DefaultMantisPropertiesLoader(System.getProperties());
             MasterMain master = new MasterMain(factory, propertiesLoader, auditEventSubscriber);
@@ -390,16 +257,6 @@ public class MasterMain implements Service {
             logger.error("Unexpected error: " + e.getMessage(), e);
             System.exit(2);
         }
-    }
-
-    private LeaderElector createLeaderElector(CuratorService curatorService,
-                                              ILeadershipManager leadershipManager) {
-        return LeaderElector.builder(leadershipManager)
-                .withCurator(curatorService.getCurator())
-                .withJsonMapper(DefaultObjectMapper.getInstance())
-                .withElectionPath(ZKPaths.makePath(config.getZkRoot(), config.getLeaderElectionPath()))
-                .withAnnouncementPath(ZKPaths.makePath(config.getZkRoot(), config.getLeaderAnnouncementPath()))
-                .build();
     }
 
     @Override
@@ -424,13 +281,6 @@ public class MasterMain implements Service {
             logger.info("Shutting down Mantis Master");
             mantisServices.shutdown();
             logger.info("mantis services shutdown complete");
-            boolean shutdownCuratorEnabled = ConfigurationProvider.getConfig().getShutdownCuratorServiceEnabled();
-            if (curatorService != null && shutdownCuratorEnabled) {
-                logger.info("Shutting down Curator Service");
-                curatorService.shutdown();
-            } else {
-                logger.info("not shutting down curator service {} shutdownEnabled? {}", curatorService, shutdownCuratorEnabled);
-            }
             blockUntilShutdown.countDown();
             logger.info("Mantis Master shutdown done");
         } else
@@ -441,30 +291,10 @@ public class MasterMain implements Service {
         return config;
     }
 
-    public String getDescriptionJson() {
-        try {
-            return DefaultObjectMapper.getInstance().writeValueAsString(leadershipManager.getDescription());
-        } catch (JsonProcessingException e) {
-            throw new IllegalStateException(String.format("Failed to convert the description %s to JSON: %s", leadershipManager.getDescription(), e.getMessage()), e);
-        }
-    }
-
-    public AgentClusterOperationsImpl getAgentClusterOps() {
-        return agentClusterOps;
-    }
-
-    public Consumer<String> getAgentVMEnabler() {
-        if (schedulingService != null) {
-            return schedulingService::enableVM;
-        } else {
-            return null;
-        }
-    }
-
     public Observable<MasterDescription> getMasterObservable() {
-        return curatorService == null ?
-                Observable.empty() :
-                curatorService.getMasterMonitor().getMasterObservable();
+        return monitor == null ?
+            Observable.empty() :
+            monitor.getMasterObservable();
     }
 
     public boolean isLeader() {

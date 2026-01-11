@@ -36,6 +36,8 @@ import io.mantisrx.master.jobcluster.job.MantisStageMetadataImpl;
 import io.mantisrx.master.jobcluster.job.worker.IMantisWorkerMetadata;
 import io.mantisrx.master.jobcluster.job.worker.JobWorker;
 import io.mantisrx.master.jobcluster.job.worker.WorkerState;
+import io.mantisrx.master.jobcluster.scaler.IJobClusterScalerRuleData;
+import io.mantisrx.master.jobcluster.scaler.JobClusterScalerRuleDataImplWritable;
 import io.mantisrx.runtime.JobOwner;
 import io.mantisrx.runtime.MantisJobDefinition;
 import io.mantisrx.runtime.MantisJobState;
@@ -88,7 +90,8 @@ public class DataFormatAdapter {
                 jobCluster.isDisabled(),
                 jobCluster.getJobClusterDefinition().getIsReadyForJobMaster(),
                 jobCluster.getJobClusterDefinition().getWorkerMigrationConfig(),
-                jobCluster.getJobClusterDefinition().getLabels());
+                jobCluster.getJobClusterDefinition().getLabels(),
+                jobCluster.getJobClusterDefinition().getJobPrincipal());
     }
 
     public static NamedJob.CompletedJob convertCompletedJobToNamedJobCompletedJob(JobClusterDefinitionImpl.CompletedJob cJob) {
@@ -115,6 +118,8 @@ public class DataFormatAdapter {
                         .withLabels(nJob.getLabels())
                         .withParameters(nJob.getParameters())
                         .withJobClusterConfigs(DataFormatAdapter.convertJarsToJobClusterConfigs(nJob.getJars()))
+                        .withIsDisabled(nJob.getDisabled())
+                        .withJobPrincipal(nJob.getJobPrincipal())
                         .build())
                 .build();
 
@@ -150,11 +155,10 @@ public class DataFormatAdapter {
 
     public static NamedJob.Jar convertJobClusterConfigToJar(JobClusterConfig jConfig) throws MalformedURLException {
         SchedulingInfo sInfo = jConfig.getSchedulingInfo();
-        String name = jConfig.getArtifactName();
         long uploadedAt = jConfig.getUploadedAt();
         String version = jConfig.getVersion();
 
-        return new NamedJob.Jar(generateURL(name), uploadedAt, version, sInfo);
+        return new NamedJob.Jar(new URL(jConfig.getJobJarUrl()), uploadedAt, version, sInfo);
     }
 
     public static JobClusterConfig convertJarToJobClusterConfig(NamedJob.Jar jar ) {
@@ -163,13 +167,13 @@ public class DataFormatAdapter {
         Optional<String> artifactName = extractArtifactName(jar.getUrl());
         String version = jar.getVersion();
         return new JobClusterConfig.Builder()
+                .withJobJarUrl(jar.getUrl().toString())
                 .withArtifactName(artifactName.orElse(""))
                 .withVersion(version)
                 .withSchedulingInfo(jar.getSchedulingInfo())
                 .withUploadedAt(jar.getUploadedAt())
                 .build();
     }
-
 
 
     public static URL generateURL(String artifactName) throws MalformedURLException {
@@ -206,6 +210,34 @@ public class DataFormatAdapter {
         return empty();
     }
 
+    /**
+     * Extracts the base part of an artifact from a URL, excluding the .zip extension if present.
+     * @param jar The URL of the artifact.
+     * @return An optional that, if possible, contains the extracted artifact base name.
+     */
+    public static Optional<String> extractArtifactBaseName(URL jar) {
+        if(jar != null) {
+            String jarStr = jar.toString();
+            return extractArtifactBaseName(jarStr);
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> extractArtifactBaseName(String jarStr) {
+        Optional<String> artifactNameOpt = extractArtifactName(jarStr);
+        if (artifactNameOpt.isPresent()) {
+            String artifactName = artifactNameOpt.get();
+            if (artifactName.endsWith(".zip")) {
+                // If the name ends with .zip, remove it
+                return Optional.of(artifactName.substring(0, artifactName.length() - 4));
+            } else {
+                // If there's no .zip extension, return the entire string
+                return Optional.of(artifactName);
+            }
+        }
+        logger.warn("Could not extract artifactBaseName from " + jarStr);
+        return Optional.empty();
+    }
 
     public static NamedJob.SLA convertSLAToNamedJobSLA(io.mantisrx.server.master.domain.SLA sla) {
 
@@ -312,6 +344,10 @@ public class DataFormatAdapter {
         writable.setReason(workerMeta.getReason());
     }
 
+    public static JobWorker convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(
+        MantisWorkerMetadata writeable, LifecycleEventPublisher eventPublisher) {
+        return convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(writeable, eventPublisher, false);
+    }
     /**
      * Convert/Deserialize metadata into a {@link JobWorker}.
      *
@@ -330,23 +366,27 @@ public class DataFormatAdapter {
      *
      * @return a valid converted job worker.
      */
-    public static JobWorker convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(MantisWorkerMetadata writeable, LifecycleEventPublisher eventPublisher) {
+    public static JobWorker convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(
+        MantisWorkerMetadata writeable, LifecycleEventPublisher eventPublisher, boolean isArchived) {
         if(logger.isDebugEnabled()) { logger.debug("DataFormatAdatper:converting worker {}", writeable); }
         String jobId = writeable.getJobId();
-        List<Integer> ports = new ArrayList<>(writeable.getNumberOfPorts());
-        ports.add(writeable.getMetricsPort());
-        ports.add(writeable.getDebugPort());
-        ports.add(writeable.getConsolePort());
-        ports.add(writeable.getCustomPort());
-        if(writeable.getPorts().size() > 0) {
-            ports.add(writeable.getPorts().get(0));
-        }
 
+        List<Integer> ports = new ArrayList<>(writeable.getNumberOfPorts());
         WorkerPorts workerPorts = null;
-        try {
-            workerPorts = new WorkerPorts(ports);
-        } catch (IllegalArgumentException | IllegalStateException e) {
-            logger.warn("problem loading worker {} for Job ID {}", writeable.getWorkerId(), jobId, e);
+        if (!isArchived) {
+            ports.add(writeable.getMetricsPort());
+            ports.add(writeable.getDebugPort());
+            ports.add(writeable.getConsolePort());
+            ports.add(writeable.getCustomPort());
+            if(!writeable.getPorts().isEmpty()) {
+                ports.add(writeable.getPorts().get(0));
+            }
+
+            try {
+                workerPorts = new WorkerPorts(ports);
+            } catch (IllegalArgumentException | IllegalStateException e) {
+                logger.warn("problem loading worker ports {} for Job ID {}", writeable.getWorkerId(), jobId, e);
+            }
         }
 
         JobWorker.Builder builder = new JobWorker.Builder()
@@ -432,6 +472,10 @@ public class DataFormatAdapter {
         return convertMantisJobWriteableToMantisJobMetadata(archJob, eventPublisher, false);
     }
 
+    public static JobClusterScalerRuleDataImplWritable convertJobClusterScalerRuleDataToWritable(IJobClusterScalerRuleData scalerRuleData) {
+        return (JobClusterScalerRuleDataImplWritable) scalerRuleData;
+    }
+
     // TODO job specific migration config is not supported, migration config will be at cluster level
     public static IMantisJobMetadata convertMantisJobWriteableToMantisJobMetadata(MantisJobMetadata archJob, LifecycleEventPublisher eventPublisher, boolean isArchived) throws Exception {
         if(logger.isTraceEnabled()) { logger.trace("DataFormatAdapter:Converting {}", archJob); }
@@ -455,7 +499,7 @@ public class DataFormatAdapter {
 
         // generate job defn
         JobDefinition jobDefn = new JobDefinition(archJob.getName(), archJob.getUser(),
-                artifactName.orElse(""), null,archJob.getParameters(), archJob.getSla(),
+                jarUrl == null ? "" : jarUrl.toString(), artifactName.orElse(""), null, archJob.getParameters(), archJob.getSla(),
                 archJob.getSubscriptionTimeoutSecs(),schedulingInfo, archJob.getNumStages(),archJob.getLabels(), null);
         Optional<JobId> jIdOp = JobId.fromId(archJob.getJobId());
         if(!jIdOp.isPresent()) {

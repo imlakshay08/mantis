@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-apply plugin: 'mantis'
-
 ext {
     archaiusVersion = '2.3.+'
     spectatorVersion = '0.82.+'
@@ -35,7 +33,7 @@ dependencies {
 
     testImplementation libraries.junit4
     testImplementation project(':mantis-runtime').sourceSets.test.output
-    testImplementation libraries.mockitoAll
-    testImplementation "com.github.tomakehurst:wiremock-jre8:2.21.0"
+    testImplementation libraries.mockitoCore
+    testImplementation libraries.wiremockjre8
     testCompileOnly "com.netflix.archaius:archaius2-core:$archaiusVersion"
 }

@@ -85,6 +85,8 @@ public interface ResourceCluster extends ResourceClusterGateway {
 
     CompletableFuture<List<TaskExecutorID>> getBusyTaskExecutors(Map<String, String> attributes);
 
+    CompletableFuture<List<TaskExecutorID>> getDisabledTaskExecutors(Map<String, String> attributes);
+
     default CompletableFuture<List<TaskExecutorID>> getUnregisteredTaskExecutors() {
         return getUnregisteredTaskExecutors(Collections.emptyMap());
     }
@@ -94,6 +96,8 @@ public interface ResourceCluster extends ResourceClusterGateway {
     CompletableFuture<ResourceOverview> resourceOverview();
 
     CompletableFuture<Ack> addNewJobArtifactsToCache(ClusterID clusterID, List<ArtifactID> artifacts);
+
+    CompletableFuture<Ack> markTaskExecutorWorkerCancelled(WorkerId workerId);
 
     CompletableFuture<Ack> removeJobArtifactsToCache(List<ArtifactID> artifacts);
 
@@ -228,6 +232,8 @@ public interface ResourceCluster extends ResourceClusterGateway {
         @Nullable
         WorkerId workerId;
         long lastHeartbeatInMs;
+        @Nullable
+        WorkerId cancelledWorkerId; // exposing this to allow better testing
     }
 
     /**

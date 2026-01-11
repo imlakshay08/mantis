@@ -26,12 +26,14 @@ import static org.mockito.Mockito.when;
 
 import com.mantisrx.common.utils.Services;
 import com.spotify.futures.CompletableFutures;
+import io.mantisrx.common.Ack;
 import io.mantisrx.common.WorkerPorts;
 import io.mantisrx.common.properties.DefaultMantisPropertiesLoader;
 import io.mantisrx.common.properties.MantisPropertiesLoader;
 import io.mantisrx.config.dynamic.LongDynamicProperty;
 import io.mantisrx.runtime.MachineDefinition;
 import io.mantisrx.server.agent.utils.DurableBooleanState;
+import io.mantisrx.server.core.domain.WorkerId;
 import io.mantisrx.server.master.resourcecluster.ClusterID;
 import io.mantisrx.server.master.resourcecluster.ResourceClusterGateway;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorDisconnection;
@@ -39,6 +41,7 @@ import io.mantisrx.server.master.resourcecluster.TaskExecutorHeartbeat;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorID;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorRegistration;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorReport;
+import io.mantisrx.server.master.resourcecluster.TaskExecutorTaskCancelledException;
 import io.mantisrx.shaded.com.google.common.collect.ImmutableMap;
 import io.mantisrx.shaded.com.google.common.util.concurrent.Service.State;
 import java.io.IOException;
@@ -51,7 +54,7 @@ import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
-import org.mockito.Matchers;
+import org.mockito.ArgumentMatchers;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
@@ -64,6 +67,8 @@ public class ResourceManagerGatewayCxnTest {
     private ResourceClusterGateway gateway;
     private ResourceManagerGatewayCxn cxn;
     private TaskExecutorReport report;
+    private TaskExecutor taskExecutor;
+    private WorkerId workerId;
 
     @Rule
     public TemporaryFolder tempFolder = new TemporaryFolder();
@@ -88,8 +93,10 @@ public class ResourceManagerGatewayCxnTest {
         gateway = mock(ResourceClusterGateway.class);
         report = TaskExecutorReport.available();
         heartbeat = new TaskExecutorHeartbeat(taskExecutorID, clusterID, report);
-        TaskExecutor taskExecutor = mock(TaskExecutor.class);
+        workerId = new WorkerId("jobId-0", 0, 1);
+        taskExecutor = mock(TaskExecutor.class);
         when(taskExecutor.getCurrentReport()).thenReturn(CompletableFuture.completedFuture(report));
+        when(taskExecutor.cancelTask(workerId)).thenReturn(CompletableFuture.completedFuture(Ack.getInstance()));
 
         MantisPropertiesLoader loader = new DefaultMantisPropertiesLoader(System.getProperties());
         LongDynamicProperty intervalDp = new LongDynamicProperty(
@@ -110,11 +117,11 @@ public class ResourceManagerGatewayCxnTest {
     @Test
     public void testIfTaskExecutorRegistersItselfWithResourceManagerAndSendsHeartbeatsPeriodically()
         throws Exception {
-        when(gateway.registerTaskExecutor(Matchers.eq(registration))).thenReturn(
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration))).thenReturn(
             CompletableFuture.completedFuture(null));
-        when(gateway.disconnectTaskExecutor(Matchers.eq(disconnection))).thenReturn(
+        when(gateway.disconnectTaskExecutor(ArgumentMatchers.eq(disconnection))).thenReturn(
             CompletableFuture.completedFuture(null));
-        when(gateway.heartBeatFromTaskExecutor(Matchers.eq(heartbeat)))
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
             .thenReturn(CompletableFuture.completedFuture(null));
         cxn.startAsync().awaitRunning();
 
@@ -126,11 +133,11 @@ public class ResourceManagerGatewayCxnTest {
 
     @Test
     public void testWhenRegistrationFailsIntermittently() throws Throwable {
-        when(gateway.heartBeatFromTaskExecutor(Matchers.eq(heartbeat)))
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
             .thenReturn(CompletableFuture.completedFuture(null));
-        when(gateway.disconnectTaskExecutor(Matchers.eq(disconnection))).thenReturn(
+        when(gateway.disconnectTaskExecutor(ArgumentMatchers.eq(disconnection))).thenReturn(
             CompletableFuture.completedFuture(null));
-        when(gateway.registerTaskExecutor(Matchers.eq(registration)))
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration)))
             .thenAnswer(new Answer<CompletableFuture<Void>>() {
                 private int count = 0;
 
@@ -154,11 +161,11 @@ public class ResourceManagerGatewayCxnTest {
 
     @Test
     public void testWhenRegistrationFailsContinuously() throws Throwable {
-        when(gateway.heartBeatFromTaskExecutor(Matchers.eq(heartbeat)))
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
             .thenReturn(CompletableFuture.completedFuture(null));
-        when(gateway.disconnectTaskExecutor(Matchers.eq(disconnection))).thenReturn(
+        when(gateway.disconnectTaskExecutor(ArgumentMatchers.eq(disconnection))).thenReturn(
             CompletableFuture.completedFuture(null));
-        when(gateway.registerTaskExecutor(Matchers.eq(registration)))
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration)))
             .thenAnswer(new Answer<CompletableFuture<Void>>() {
                 private int count = 0;
 
@@ -176,9 +183,9 @@ public class ResourceManagerGatewayCxnTest {
 
     @Test
     public void testWhenHeartbeatFailsIntermittently() throws Exception {
-        when(gateway.registerTaskExecutor(Matchers.eq(registration))).thenReturn(
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration))).thenReturn(
             CompletableFuture.completedFuture(null));
-        when(gateway.heartBeatFromTaskExecutor(Matchers.eq(heartbeat)))
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
             .thenAnswer(new Answer<CompletableFuture<Void>>() {
                 private int count = 0;
 
@@ -200,12 +207,28 @@ public class ResourceManagerGatewayCxnTest {
     }
 
     @Test
+    public void testWhenHeartbeatFailsWithTaskCancelled() throws Exception {
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration))).thenReturn(
+            CompletableFuture.completedFuture(null));
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
+            .thenAnswer((Answer<CompletableFuture<Void>>) invocation ->
+                CompletableFutures.exceptionallyCompletedFuture(
+                    new TaskExecutorTaskCancelledException("mock error", workerId)));
+        cxn.startAsync();
+        Thread.sleep(1000);
+
+        verify(taskExecutor, atLeastOnce()).cancelTask(workerId);
+        assertEquals(cxn.state(), State.RUNNING);
+        assertTrue(cxn.isRegistered());
+    }
+
+    @Test
     public void testWhenHeartbeatFailsContinuously() throws Exception {
-        when(gateway.registerTaskExecutor(Matchers.eq(registration))).thenReturn(
+        when(gateway.registerTaskExecutor(ArgumentMatchers.eq(registration))).thenReturn(
             CompletableFuture.completedFuture(null));
         CountDownLatch startSignal = new CountDownLatch(1);
         CountDownLatch isNotRegisteredSignal = new CountDownLatch(5);
-        when(gateway.heartBeatFromTaskExecutor(Matchers.eq(heartbeat)))
+        when(gateway.heartBeatFromTaskExecutor(ArgumentMatchers.eq(heartbeat)))
             .thenAnswer(new Answer<CompletableFuture<Void>>() {
                 private int count = 0;
 
@@ -221,7 +244,7 @@ public class ResourceManagerGatewayCxnTest {
                         new UnknownError("error"));
                 }
             });
-        when(gateway.disconnectTaskExecutor(Matchers.eq(disconnection))).thenReturn(
+        when(gateway.disconnectTaskExecutor(ArgumentMatchers.eq(disconnection))).thenReturn(
             CompletableFuture.completedFuture(null));
         cxn.startAsync();
         // wait for the heart beat failure

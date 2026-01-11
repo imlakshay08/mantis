@@ -180,9 +180,9 @@ public abstract class PushServer<T, R> {
                                                 final Subscription heartbeatSubscription, boolean applySampling, long samplingRateMSec,
                                                 Func1<T, Boolean> predicate, final Action0 connectionClosedCallback,
                                                 final Counter legacyMsgProcessedCounter, final Counter legacyDroppedWrites,
-                                                final Action0 connectionSubscribeCallback) {
+                                                final Action0 connectionSubscribeCallback, final String availabilityZone) {
         return manageConnection(writer, host, port, groupId, slotId, id, lastWriteTime, applicationHeartbeats, heartbeatSubscription,
-            applySampling, samplingRateMSec, null, null, predicate, connectionClosedCallback, legacyMsgProcessedCounter, legacyDroppedWrites, connectionSubscribeCallback);
+            applySampling, samplingRateMSec, null, null, predicate, connectionClosedCallback, legacyMsgProcessedCounter, legacyDroppedWrites, connectionSubscribeCallback, availabilityZone);
     }
 
     protected Observable<Void> manageConnection(final DefaultChannelWriter<R> writer, String host, int port,
@@ -191,9 +191,9 @@ public abstract class PushServer<T, R> {
                                                 final SerializedSubject<String, String> metaMsgSubject, final Subscription metaMsgSubscription,
                                                 Func1<T, Boolean> predicate, final Action0 connectionClosedCallback,
                                                 final Counter legacyMsgProcessedCounter, final Counter legacyDroppedWrites,
-                                                final Action0 connectionSubscribeCallback) {
+                                                final Action0 connectionSubscribeCallback, final String availabilityZone) {
         return manageConnectionWithCompression(writer, host, port, groupId, slotId, id, lastWriteTime, applicationHeartbeats, heartbeatSubscription,
-            applySampling, samplingRateMSec, null, null, predicate, connectionClosedCallback, legacyMsgProcessedCounter, legacyDroppedWrites, connectionSubscribeCallback, false, false, null);
+            applySampling, samplingRateMSec, null, null, predicate, connectionClosedCallback, legacyMsgProcessedCounter, legacyDroppedWrites, connectionSubscribeCallback, false, false, null, availabilityZone);
 
     }
 
@@ -231,7 +231,7 @@ public abstract class PushServer<T, R> {
                                                                Func1<T, Boolean> predicate, final Action0 connectionClosedCallback,
                                                                final Counter legacyMsgProcessedCounter, final Counter legacyDroppedWrites,
                                                                final Action0 connectionSubscribeCallback, boolean compressOutput, boolean isSSE,
-                                                               byte[] delimiter) {
+                                                               byte[] delimiter, String availabilityZone) {
 
         if (id == null || id.isEmpty()) {
             id = host + "_" + port + "_" + System.currentTimeMillis();
@@ -245,11 +245,11 @@ public abstract class PushServer<T, R> {
             groupId = id;
         }
 
-        final BasicTag slotIdTag = new BasicTag("slotId", slotId);
+        final BasicTag clientIdTag = new BasicTag(CLIENT_ID_TAG_NAME, Optional.ofNullable(groupId).orElse("none"));
 
         SerializedSubject<List<byte[]>, List<byte[]>> subject
             = new SerializedSubject<>(PublishSubject.<List<byte[]>>create());
-        Observable<List<byte[]>> observable = subject.lift(new DropOperator<>("batch_writes", slotIdTag));
+        Observable<List<byte[]>> observable = subject.lift(new DropOperator<>("batch_writes", clientIdTag));
 
         if (applySampling) {
             observable =
@@ -266,7 +266,6 @@ public abstract class PushServer<T, R> {
                     );
         }
 
-        final BasicTag clientIdTag = new BasicTag(CLIENT_ID_TAG_NAME, Optional.ofNullable(groupId).orElse("none"));
         Metrics writableMetrics = new Metrics.Builder()
             .id("PushServer", clientIdTag)
             .addCounter("channelWritable")
@@ -308,7 +307,7 @@ public abstract class PushServer<T, R> {
         }
 
         final AsyncConnection<T> connection = new AsyncConnection<T>(host,
-            port, id, slotId, groupId, subject, predicate);
+            port, id, slotId, groupId, subject, predicate, availabilityZone);
 
         final Channel channel = writer.getChannel();
         channel.closeFuture().addListener(new GenericFutureListener<io.netty.util.concurrent.Future<Void>>() {

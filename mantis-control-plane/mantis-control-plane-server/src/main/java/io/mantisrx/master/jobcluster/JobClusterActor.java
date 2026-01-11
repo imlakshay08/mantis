@@ -24,6 +24,8 @@ import static io.mantisrx.master.jobcluster.proto.BaseResponse.ResponseCode.CLIE
 import static io.mantisrx.master.jobcluster.proto.BaseResponse.ResponseCode.CLIENT_ERROR_NOT_FOUND;
 import static io.mantisrx.master.jobcluster.proto.BaseResponse.ResponseCode.SERVER_ERROR;
 import static io.mantisrx.master.jobcluster.proto.BaseResponse.ResponseCode.SUCCESS;
+import static io.mantisrx.runtime.descriptor.JobScalingRule.TRIGGER_TYPE_CUSTOM;
+import static io.mantisrx.runtime.descriptor.JobScalingRule.TRIGGER_TYPE_SCHEDULE;
 import static java.util.Optional.empty;
 import static java.util.Optional.of;
 import static java.util.Optional.ofNullable;
@@ -46,8 +48,8 @@ import io.mantisrx.common.metrics.Metrics;
 import io.mantisrx.common.metrics.MetricsRegistry;
 import io.mantisrx.common.metrics.spectator.GaugeCallback;
 import io.mantisrx.common.metrics.spectator.MetricGroupId;
+import io.mantisrx.common.akka.MantisActorSupervisorStrategy;
 import io.mantisrx.master.JobClustersManagerActor.UpdateSchedulingInfo;
-import io.mantisrx.master.akka.MantisActorSupervisorStrategy;
 import io.mantisrx.master.api.akka.route.proto.JobClusterProtoAdapter.JobIdInfo;
 import io.mantisrx.master.events.LifecycleEventPublisher;
 import io.mantisrx.master.events.LifecycleEventsProto;
@@ -110,14 +112,15 @@ import io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.UpdateScheduli
 import io.mantisrx.master.jobcluster.proto.JobClusterProto;
 import io.mantisrx.master.jobcluster.proto.JobClusterProto.JobStartedEvent;
 import io.mantisrx.master.jobcluster.proto.JobClusterProto.KillJobRequest;
+import io.mantisrx.master.jobcluster.proto.JobClusterScalerRuleProto;
 import io.mantisrx.master.jobcluster.proto.JobProto;
-import io.mantisrx.runtime.JobConstraints;
+import io.mantisrx.master.jobcluster.scaler.IJobClusterScalerRuleData;
+import io.mantisrx.master.jobcluster.scaler.JobClusterScalerRuleDataFactory;
+import io.mantisrx.master.jobcluster.scaler.JobClusterScalerRuleDataImplWritable;
 import io.mantisrx.runtime.JobSla;
 import io.mantisrx.runtime.command.InvalidJobException;
-import io.mantisrx.runtime.descriptor.StageSchedulingInfo;
 import io.mantisrx.server.core.JobCompletedReason;
-import io.mantisrx.server.master.ConstraintsEvaluators;
-import io.mantisrx.server.master.InvalidJobRequest;
+import io.mantisrx.server.master.InvalidJobRequestException;
 import io.mantisrx.server.master.config.ConfigurationProvider;
 import io.mantisrx.server.master.domain.IJobClusterDefinition;
 import io.mantisrx.server.master.domain.IJobClusterDefinition.CronPolicy;
@@ -132,6 +135,7 @@ import io.mantisrx.server.master.persistence.exceptions.JobClusterAlreadyExistsE
 import io.mantisrx.server.master.scheduler.MantisScheduler;
 import io.mantisrx.server.master.scheduler.MantisSchedulerFactory;
 import io.mantisrx.server.master.scheduler.WorkerEvent;
+import io.mantisrx.shaded.com.google.common.base.Strings;
 import io.mantisrx.shaded.com.google.common.base.Throwables;
 import io.mantisrx.shaded.com.google.common.collect.Lists;
 import java.io.IOException;
@@ -139,6 +143,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -203,8 +208,20 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         final MantisJobStore jobStore,
         final MantisSchedulerFactory mantisSchedulerFactory,
         final LifecycleEventPublisher eventPublisher,
-        final CostsCalculator costsCalculator) {
-        return Props.create(JobClusterActor.class, name, jobStore, mantisSchedulerFactory, eventPublisher, costsCalculator);
+        final CostsCalculator costsCalculator,
+        final int slaHeadroomForAcceptedJobs,
+        final JobClusterScalerRuleDataFactory jobClusterScalerRuleDataFactory) {
+        return Props.create(JobClusterActor.class, name, jobStore, mantisSchedulerFactory, eventPublisher, costsCalculator, slaHeadroomForAcceptedJobs, jobClusterScalerRuleDataFactory);
+    }
+
+    public static Props props(
+        final String name,
+        final MantisJobStore jobStore,
+        final MantisSchedulerFactory mantisSchedulerFactory,
+        final LifecycleEventPublisher eventPublisher,
+        final CostsCalculator costsCalculator,
+        final int slaHeadroomForAcceptedJobs) {
+        return Props.create(JobClusterActor.class, name, jobStore, mantisSchedulerFactory, eventPublisher, costsCalculator, slaHeadroomForAcceptedJobs, (JobClusterScalerRuleDataFactory)JobClusterScalerRuleDataImplWritable::of);
     }
 
     private final Receive initializedBehavior;
@@ -214,6 +231,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
     private final String name;
     private final MantisJobStore jobStore;
     private IJobClusterMetadata jobClusterMetadata;
+    private IJobClusterScalerRuleData jobClusterScalerRuleData; // todo: logging + metrics
     private CronManager cronManager;
 
     private SLAEnforcer slaEnforcer;
@@ -221,9 +239,11 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
     private final MantisSchedulerFactory mantisSchedulerFactory;
     private final LifecycleEventPublisher eventPublisher;
 
-    private final BehaviorSubject<JobId> jobIdSubmissionSubject;
+    private final BehaviorSubject<JobId> jobIdStartedSubject;
     private final JobDefinitionResolver jobDefinitionResolver = new JobDefinitionResolver();
     private final Metrics metrics;
+
+    private final int slaHeadroomForAcceptedJobs;
 
 
     public JobClusterActor(
@@ -231,15 +251,19 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         final MantisJobStore jobStore,
         final MantisSchedulerFactory schedulerFactory,
         final LifecycleEventPublisher eventPublisher,
-        final CostsCalculator costsCalculator) {
+        final CostsCalculator costsCalculator,
+        final int slaHeadroomForAcceptedJobs,
+        JobClusterScalerRuleDataFactory jobClusterScalerRuleDataFactory) {
         this.name = name;
         this.jobStore = jobStore;
         this.mantisSchedulerFactory = schedulerFactory;
         this.eventPublisher = eventPublisher;
+        this.slaHeadroomForAcceptedJobs = slaHeadroomForAcceptedJobs;
+        this.jobClusterScalerRuleData = jobClusterScalerRuleDataFactory.create(name);
 
         this.jobManager = new JobManager(name, getContext(), mantisSchedulerFactory, eventPublisher, jobStore, costsCalculator);
 
-        jobIdSubmissionSubject = BehaviorSubject.create();
+        jobIdStartedSubject = BehaviorSubject.create();
 
         initializedBehavior =  buildInitializedBehavior();
         disabledBehavior = buildDisabledBehavior();
@@ -523,6 +547,11 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             .match(JobClusterProto.TriggerCronRequest.class, (x) -> logger.warn(genUnexpectedMsg(x.toString(), this.name, state)))
             .match(DisableJobClusterRequest.class, (x) -> getSender().tell(new DisableJobClusterResponse(x.requestId, CLIENT_ERROR, genUnexpectedMsg(x.toString(), this.name, state)), getSelf()))
 
+            .match(JobClusterScalerRuleProto.CreateScalerRuleRequest.class, (x) -> getSender().tell(JobClusterScalerRuleProto.CreateScalerRuleResponse.builder().requestId(x.requestId).responseCode(CLIENT_ERROR_NOT_FOUND).message(genUnexpectedMsg(x.toString(), this.name, state)).build(), getSelf()))
+            .match(JobClusterScalerRuleProto.DeleteScalerRuleRequest.class, (x) -> getSender().tell(JobClusterScalerRuleProto.DeleteScalerRuleResponse.builder().requestId(x.requestId).responseCode(CLIENT_ERROR_NOT_FOUND).message(genUnexpectedMsg(x.toString(), this.name, state)).build(), getSelf()))
+            .match(JobClusterScalerRuleProto.GetScalerRulesRequest.class, (x) -> getSender().tell(JobClusterScalerRuleProto.GetScalerRulesResponse.builder().requestId(x.requestId).responseCode(CLIENT_ERROR_NOT_FOUND).message(genUnexpectedMsg(x.toString(), this.name, state)).build(), getSelf()))
+            .match(JobClusterScalerRuleProto.GetJobScalerRuleStreamRequest.class, (x) -> getSender().tell(JobClusterScalerRuleProto.GetJobScalerRuleStreamSubjectResponse.builder().requestId(x.requestId).responseCode(CLIENT_ERROR_NOT_FOUND).message(genUnexpectedMsg(x.toString(), this.name, state)).build(), getSelf()))
+
             .match(Terminated.class, this::onTerminated)
 
             // UNEXPECTED MESSAGES END //
@@ -611,6 +640,10 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 .match(JobStartedEvent.class, this::onJobStarted)
                 .match(GetLastSubmittedJobIdStreamRequest.class, this::onGetLastSubmittedJobIdSubject)
                 .match(ScaleStageRequest.class, this::onScaleStage)
+                .match(JobClusterScalerRuleProto.CreateScalerRuleRequest.class, this::onScalerRuleCreate)
+                .match(JobClusterScalerRuleProto.DeleteScalerRuleRequest.class, this::onScalerRuleDelete)
+                .match(JobClusterScalerRuleProto.GetScalerRulesRequest.class, this::onScalerRuleGet)
+                .match(JobClusterScalerRuleProto.GetJobScalerRuleStreamRequest.class, this::onJobScalerRuleStream)
                  // EXPECTED MESSAGES END //
                  // EXPECTED MESSAGES BEGIN //
                 .match(JobClusterProto.InitializeJobClusterRequest.class,(x) -> getSender().tell(
@@ -698,6 +731,17 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         // create sla enforcer
         slaEnforcer = new SLAEnforcer(jobClusterMetadata.getJobClusterDefinition().getSLA());
         long expireFrequency = ConfigurationProvider.getConfig().getCompletedJobPurgeFrequencySeqs();
+        String jobClusterName = jobClusterMetadata.getJobClusterDefinition().getName();
+
+        // init scaler rules
+        try {
+            IJobClusterScalerRuleData scalerRuleData = jobStore.getJobClusterScalerData(jobClusterName);
+            if (scalerRuleData != null) {
+                this.jobClusterScalerRuleData = scalerRuleData;
+            }
+        } catch (IOException iex) {
+            logger.error("Failed to load job cluster: {} scaler rules. Fall back to empty rules", this.name, iex);
+        }
 
         // If cluster is disabled
         if(jobClusterMetadata.isDisabled()) {
@@ -715,7 +759,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             int count = 50;
             if(!initReq.jobList.isEmpty()) {
                 logger.info("Cluster {} is disabled however it has {} active/accepted jobs",
-                        jobClusterMetadata.getJobClusterDefinition().getName(), initReq.jobList.size());
+                    jobClusterName, initReq.jobList.size());
                 for(IMantisJobMetadata jobMeta : initReq.jobList) {
                     try {
                         if(count == 0) {
@@ -725,7 +769,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                         if(!JobState.isTerminalState(jobMeta.getState())) {
                             logger.info("Job {} is in non terminal state {} for disabled cluster {}."
                                     + "Marking it complete", jobMeta.getJobId(), jobMeta.getState(),
-                                    jobClusterMetadata.getJobClusterDefinition().getName());
+                                jobClusterName);
                             count--;
                             jobManager.markCompleted(jobMeta);
                             jobStore.archiveJob(jobMeta);
@@ -752,10 +796,11 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             if (initReq.createInStore) {
                 try {
                     jobStore.createJobCluster(jobClusterMetadata);
+                    // TODO (p1): support scale rules creation during job cluster creation.
                     eventPublisher.publishAuditEvent(
                             new LifecycleEventsProto.AuditEvent(
                                     LifecycleEventsProto.AuditEvent.AuditEventType.JOB_CLUSTER_CREATE,
-                                    jobClusterMetadata.getJobClusterDefinition().getName(),
+                                jobClusterName,
                                     "saved job cluster " + name)
                     );
                     logger.info("successfully saved job cluster {}", name);
@@ -787,6 +832,11 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 cronManager = new CronManager(name, getSelf(), jobClusterMetadata.getJobClusterDefinition().getSLA());
             } catch (Exception e) {
                 logger.warn("Exception initializing cron", e);
+                getSender().tell(new JobClusterManagerProto.CreateJobClusterResponse(
+                    initReq.requestId, e instanceof SchedulerException?CLIENT_ERROR:SERVER_ERROR,
+                    "Job Cluster " + jobClusterName + " could not be created due to cron initialization error" + e.getMessage(),
+                    jobClusterName), getSelf());
+                return;
             }
             initRunningJobs(initReq, sender);
 
@@ -841,8 +891,10 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                      }
                  })
                  //
-                 .flatMap((jobMeta) -> jobManager.bootstrapJob((MantisJobMetadataImpl)jobMeta, this.jobClusterMetadata))
-
+                 .flatMap((jobMeta) -> jobManager.bootstrapJob(
+                     (MantisJobMetadataImpl)jobMeta,
+                     this.jobClusterMetadata,
+                     this.jobClusterScalerRuleData))
                  .subscribe((jobInited) -> {
                             logger.info("Job Id {} initialized with code {}", jobInited.jobId, jobInited.responseCode);
                         },
@@ -850,9 +902,16 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                          ,() -> {
                             // Push the last jobId
 
-                             if(initReq.jobList.size() > 0) {
+                             if(!initReq.jobList.isEmpty()) {
                                  JobId lastJobId = new JobId(this.name, initReq.lastJobNumber);
-                                 this.jobIdSubmissionSubject.onNext(lastJobId);
+                                 JobId lastLaunchedJobId = initReq.jobList.stream()
+                                     .filter(job -> job.getState() == JobState.Launched)
+                                     .max(Comparator.comparingLong(a -> a.getJobId().getJobNum()))
+                                     .map(jm -> new JobId(this.name, jm.getJobId().getJobNum()))
+                                     .orElse(lastJobId);
+                                logger.info("Publish last launched job id: {}, last submit job id: {}",
+                                    lastLaunchedJobId, lastJobId);
+                                 this.jobIdStartedSubject.onNext(lastLaunchedJobId);
                              }
 
 
@@ -906,7 +965,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         } catch  (Exception e) {
             logger.error("job cluster not created");
             sender.tell(new UpdateJobClusterResponse(request.requestId, SERVER_ERROR, name
-                    + " Job cluster updation failed " + e.getMessage()), getSelf());
+                    + " Job cluster update failed " + e.getMessage()), getSelf());
             numJobClusterUpdateErrors.increment();
         }
     }
@@ -1261,13 +1320,13 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                     .withLastJobCount(this.jobClusterMetadata.getLastJobCount())
                     .withJobClusterDefinition((JobClusterDefinitionImpl)this.jobClusterMetadata.getJobClusterDefinition())
                     .build();
-            //update store
-            jobStore.updateJobCluster(jobClusterMetadata);
-            this.jobClusterMetadata = jobClusterMetadata;
             if (cronManager == null) {
                 cronManager = new CronManager(name, getSelf(), jobClusterMetadata.getJobClusterDefinition().getSLA());
             }
             this.cronManager.initCron();
+            //update store after cron init
+            jobStore.updateJobCluster(jobClusterMetadata);
+            this.jobClusterMetadata = jobClusterMetadata;
             // change behavior to enabled
             getContext().become(initializedBehavior);
 
@@ -1284,7 +1343,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         } catch(Exception e) {
             String errorMsg = String.format("Exception enabling cluster %s due to %s", name, e.getMessage());
             logger.error(errorMsg,e);
-            sender.tell(new EnableJobClusterResponse(req.requestId, SERVER_ERROR, errorMsg), getSelf());
+            sender.tell(new EnableJobClusterResponse(req.requestId, e instanceof SchedulerException?CLIENT_ERROR:SERVER_ERROR, errorMsg), getSelf());
             numJobClusterEnableErrors.increment();
         }
         if(logger.isTraceEnabled()) { logger.trace("Enter onJobClusterEnable"); }
@@ -1309,6 +1368,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 .withIsReadyForJobMaster(jobClusterMetadata.getJobClusterDefinition().getIsReadyForJobMaster())
                 .withJars(jobClusterMetadata.getJobClusterDefinition().getJobClusterConfigs())
                 .withJobOwner(jobClusterMetadata.getJobClusterDefinition().getOwner())
+                .withJobPrincipal(jobClusterMetadata.getJobClusterDefinition().getJobPrincipal())
                 .withLabels(jobClusterMetadata.getJobClusterDefinition().getLabels())
                 .withLastJobCount(jobClusterMetadata.getLastJobCount())
                 .withSla(jobClusterMetadata.getJobClusterDefinition().getSLA())
@@ -1514,6 +1574,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         return
             new JobDefinition.Builder()
                 .withJobSla(new JobSla.Builder().build())
+                .withJobJarUrl(clusterConfig.getJobJarUrl())
                 .withArtifactName(clusterConfig.getArtifactName())
                 .withVersion(clusterConfig.getVersion())
                 .withLabels(clusterDefinition.getLabels())
@@ -1550,7 +1611,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 new LifecycleEventsProto.AuditEvent(LifecycleEventsProto.AuditEvent.AuditEventType.JOB_SUBMIT,
                     jId.getId(), jId + " submitter: " + user)
             );
-            jobManager.initJob(mantisJobMetaData, jobClusterMetadata, sender);
+            jobManager.initJob(mantisJobMetaData, jobClusterMetadata, jobClusterScalerRuleData, sender);
 
             numJobActorCreationCounter.increment();
             jobClusterMetadata = new JobClusterMetadataImpl.Builder().withJobClusterDefinition((JobClusterDefinitionImpl)this.jobClusterMetadata.getJobClusterDefinition())
@@ -1566,11 +1627,10 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 throw new PersistException(e);
             }
 
-            jobIdSubmissionSubject.onNext(jId);
             numJobSubmissions.increment();
         } catch (PersistException pe) {
             throw pe;
-        } catch (InvalidJobRequest e) {
+        } catch (InvalidJobRequestException e) {
             logger.error( "Invalid jobcluster : {} error {}", jobClusterMetadata, e.getMessage(), e);
             numJobSubmissionFailures.increment();
             throw new IllegalArgumentException(e);
@@ -1620,6 +1680,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         if(jobInfoOp.isPresent()) {
             // enforce SLA
             jobManager.markJobStarted(jobInfoOp.get());
+            this.jobIdStartedSubject.onNext(startedEvent.jobid);
             getSelf().tell(new JobClusterProto.EnforceSLARequest(Instant.now(), of(jobInfoOp.get().jobDefinition)), getSelf());
         }
 
@@ -1655,54 +1716,25 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
     /**
      *
      * @param definition Job Definition to be validated
-     * @throws InvalidJobRequest If the job definition is invalid
+     * @throws InvalidJobRequestException If the job definition is invalid
      */
-    private void validateJobDefinition(JobDefinition definition) throws InvalidJobRequest {
+    private void validateJobDefinition(JobDefinition definition) throws InvalidJobRequestException {
         if (definition == null) {
-            throw new InvalidJobRequest(null, "MantisJobDefinition cannot be null");
+            throw new InvalidJobRequestException("MantisJobDefinition cannot be null");
+        }
+        if (definition.getJobJarUrl() == null) {
+            throw new InvalidJobRequestException("MantisJobDefinition job jobJarUrl attribute cannot be null");
         }
         if (definition.getArtifactName() == null) {
-            throw new InvalidJobRequest(null, "MantisJobDefinition job artifactName attribute cannot be null");
+            throw new InvalidJobRequestException("MantisJobDefinition job artifactName attribute cannot be null");
         }
         if (definition.getName() == null) {
-            throw new InvalidJobRequest(null, "MantisJobDefinition name attribute cannot be null");
+            throw new InvalidJobRequestException("MantisJobDefinition name attribute cannot be null");
         }
 
         if (definition.getSchedulingInfo() == null) {
-            throw new InvalidJobRequest(null, "MantisJobDefinition schedulingInfo cannot be null");
+            throw new InvalidJobRequestException("MantisJobDefinition schedulingInfo cannot be null");
         }
-
-        for (StageSchedulingInfo ssi : definition.getSchedulingInfo().getStages().values()) {
-            validateConstraints(ssi.getSoftConstraints(), ssi.getHardConstraints());
-        }
-    }
-
-    private void validateConstraints(List<JobConstraints> softConstraints, List<JobConstraints> hardConstraints) throws InvalidJobRequest {
-        // ok to have null constraints as they will get replaced later with empty list in JobActor.setupStageWorkers
-        if(softConstraints != null) {
-
-            for (JobConstraints jc : softConstraints) {
-                if (ConstraintsEvaluators.softConstraint(jc, new HashSet<>()) == null) {
-                    logger.error("Invalid Soft Job Constraint {}", jc);
-                    throw new InvalidJobRequest(null, "Unknown constraint " + jc);
-
-                }
-            }
-            ;
-        }
-
-        if(hardConstraints != null ) {
-            for (JobConstraints jc : hardConstraints) {
-                if (ConstraintsEvaluators.hardConstraint(jc, new HashSet<>()) == null) {
-                    logger.error("Invalid Hard Job Constraint {}", jc);
-                    throw new InvalidJobRequest(null, "Unknown constraint " + jc);
-
-                }
-            }
-            ;
-        }
-
-
     }
 
     @Override
@@ -1893,7 +1925,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
 
                 }
             } else {
-                logger.warn("No such job {} ", req.getJobId());
+                logger.debug("No such job {} ", req.getJobId());
             }
         }
         getSender().tell(response, getSelf());
@@ -1905,7 +1937,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         if(logger.isTraceEnabled()) { logger.trace("Enter onGetLatestJobDiscoveryInfo {}", request); }
         ActorRef sender = getSender();
         if(this.name.equals(request.getJobCluster())) {
-            JobId latestJobId = jobIdSubmissionSubject.getValue();
+            JobId latestJobId = this.jobIdStartedSubject.getValue();
             logger.debug("[{}] latest job Id for cluster: {}", name, latestJobId);
             if (latestJobId != null) {
                 Optional<JobInfo> jInfo = jobManager.getJobInfoForNonTerminalJob(latestJobId);
@@ -1960,7 +1992,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         if(logger.isTraceEnabled()) { logger.trace("Enter onGetLastSubmittedJobIdSubject {}", request); }
         ActorRef sender = getSender();
         if(this.name.equals(request.getClusterName())) {
-            sender.tell(new GetLastSubmittedJobIdStreamResponse(request.requestId,SUCCESS,"",of(this.jobIdSubmissionSubject)),getSelf());
+            sender.tell(new GetLastSubmittedJobIdStreamResponse(request.requestId,SUCCESS,"",of(this.jobIdStartedSubject)),getSelf());
         } else {
             String msg = "Job Cluster " + request.getClusterName() + " In request does not match the name of this actor " + this.name;
             logger.warn(msg);
@@ -1991,7 +2023,6 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
 
         List<JobInfo> jobsStuckInTerminatingList = jobManager.getJobsStuckInTerminating(now, getExpireAcceptedDelayMs());
 
-
         if(!slaEnforcer.hasSLA()) {
             return;
         }
@@ -2019,7 +2050,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             listOfJobs.addAll(jobManager.getActiveJobsList());
             listOfJobs.addAll(jobManager.getAcceptedJobsList());
 
-            List<JobId> jobsToKill = slaEnforcer.enforceSLAMax(Collections.unmodifiableList(listOfJobs));
+            List<JobId> jobsToKill = slaEnforcer.enforceSLAMax(Collections.unmodifiableList(listOfJobs), this.slaHeadroomForAcceptedJobs);
 
             for (JobId jobId : jobsToKill) {
                 logger.info("Request termination for job {}", jobId);
@@ -2141,24 +2172,23 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                     .withJobClusterDefinition(updatedDefn)
                     .build();
 
-            updateAndSaveJobCluster(jobCluster);
             if(cronManager != null)
                 cronManager.destroyCron();
             this.cronManager = new CronManager(name, getSelf(), newSla);
-
+            updateAndSaveJobCluster(jobCluster); //update after cron succeeds
             sender.tell(new UpdateJobClusterSLAResponse(slaRequest.requestId, SUCCESS, name + " SLA updated"), getSelf());
 
             eventPublisher.publishAuditEvent(
                     new LifecycleEventsProto.AuditEvent(LifecycleEventsProto.AuditEvent.AuditEventType.JOB_CLUSTER_UPDATE,
                         jobClusterMetadata.getJobClusterDefinition().getName(), name+" SLA update")
             );
-        } catch(IllegalArgumentException e) {
+        } catch(IllegalArgumentException | SchedulerException e) {
             logger.error("Invalid arguement job cluster not updated ", e);
-            sender.tell(new UpdateJobClusterSLAResponse(slaRequest.requestId, CLIENT_ERROR, name + " Job cluster SLA updation failed " + e.getMessage()), getSelf());
+            sender.tell(new UpdateJobClusterSLAResponse(slaRequest.requestId, CLIENT_ERROR, name + " Job cluster SLA update failed " + e.getMessage()), getSelf());
 
         } catch(Exception e) {
             logger.error("job cluster not updated ", e);
-            sender.tell(new UpdateJobClusterSLAResponse(slaRequest.requestId, SERVER_ERROR, name + " Job cluster SLA updation failed " + e.getMessage()), getSelf());
+            sender.tell(new UpdateJobClusterSLAResponse(slaRequest.requestId, SERVER_ERROR, name + " Job cluster SLA update failed " + e.getMessage()), getSelf());
         }
         if(logger.isTraceEnabled()) { logger.trace("Exit onJobClusterUpdateSLA {}", slaRequest); }
     }
@@ -2209,6 +2239,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 return;
             }
             JobClusterConfig newConfig = new JobClusterConfig.Builder().from(jobClusterMetadata.getJobClusterDefinition().getJobClusterConfig())
+                    .withJobJarUrl(artifactReq.getjobJarUrl())
                     .withArtifactName(artifactReq.getArtifactName())
                     .withVersion(artifactReq.getVersion())
                     .withUploadedAt(System.currentTimeMillis())
@@ -2331,6 +2362,24 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         if(logger.isTraceEnabled()) { logger.trace("Exit JobClusterActor:updateAndSaveJobCluster {}", jobCluster.getJobClusterDefinition().getName()); }
     }
 
+    private void updateAndSaveScalerRules(JobClusterScalerRuleProto.CreateScalerRuleRequest request) throws Exception {
+        // merge or create local rule data
+        IJobClusterScalerRuleData mergedJobClusterScalerRuleData = this.jobClusterScalerRuleData.merge(request);
+        jobStore.updateJobClusterScalerRule(mergedJobClusterScalerRuleData);
+        this.jobClusterScalerRuleData = mergedJobClusterScalerRuleData;
+
+        logger.info("successfully updated job cluster scaler rules: {}", this.jobClusterScalerRuleData);
+    }
+
+    private void updateAndSaveScalerRules(JobClusterScalerRuleProto.DeleteScalerRuleRequest request) throws Exception {
+        IJobClusterScalerRuleData mergedJobClusterScalerRuleData =
+            this.jobClusterScalerRuleData.delete(request.getRuleId());
+        jobStore.updateJobClusterScalerRule(mergedJobClusterScalerRuleData);
+        this.jobClusterScalerRuleData = mergedJobClusterScalerRuleData;
+
+        logger.info("deleted job cluster scaler rule {}. Now: {}", request.getRuleId(), this.jobClusterScalerRuleData);
+    }
+
     /**
      * Fetch job definition for quick submit mode.
      * If a job definition is passed return it immediately
@@ -2414,6 +2463,174 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
         if(logger.isTraceEnabled()) { logger.trace("Exit JCA:onResubmitWorker {}", req); }
     }
 
+    public void onScalerRuleCreate(JobClusterScalerRuleProto.CreateScalerRuleRequest req) {
+        // when a new rule is added, do the following:
+        // - merge/create local rule data
+        // - persist updated data
+        // - forward new data to all active job actors.
+
+        if (logger.isTraceEnabled()) {
+            logger.trace("Enter JCA:onScalerRuleCreate {}", req);
+        }
+
+        ActorRef sender = getSender();
+        try {
+            Optional<String> errMsgO = validateRuleCreationRequest(req);
+            if (errMsgO.isPresent()) {
+                logger.warn("rule validation failed: {} on {}", errMsgO.get(), req.getJobClusterName());
+                sender.tell(
+                    JobClusterScalerRuleProto.CreateScalerRuleResponse.builder()
+                        .requestId(req.requestId)
+                        .responseCode(CLIENT_ERROR)
+                        .message(errMsgO.get())
+                        .build(),
+                    getSelf()
+                );
+                return;
+            }
+
+            // update local state + persist rules
+            updateAndSaveScalerRules(req);
+
+            // Forward the request to all active job actors.
+            jobManager.getJobInfoForActiveJobs()
+                .ifPresent(jobInfos -> jobInfos.forEach(
+                    ji -> ji.jobActor.forward(this.jobClusterScalerRuleData, getContext())));
+
+            sender.tell(
+                JobClusterScalerRuleProto.CreateScalerRuleResponse.builder()
+                    .requestId(req.requestId)
+                    .responseCode(SUCCESS)
+                    .ruleId(String.valueOf(this.jobClusterScalerRuleData.getLastRuleIdNumber()))
+                    .build(),
+                getSelf());
+        } catch (Exception ex) {
+            logger.error("Error updating scaler rule for {}", this.name, ex);
+            sender.tell(
+                JobClusterScalerRuleProto.CreateScalerRuleResponse.builder()
+                    .requestId(req.requestId)
+                    .responseCode(CLIENT_ERROR)
+                    .message(String.format("Could not create scaler rule for %s due to %s", this.name, ex.getMessage()))
+                    .build(),
+                getSelf()
+            );
+        }
+
+        if (logger.isTraceEnabled()) {
+            logger.trace("Exit JCA:onScalerRuleCreate {}", req);
+        }
+    }
+
+    private static Optional<String> validateRuleCreationRequest(JobClusterScalerRuleProto.CreateScalerRuleRequest req) {
+        String errMsg = null;
+        if (req.getTriggerConfig() == null ||
+            Strings.isNullOrEmpty(req.getTriggerConfig().getTriggerType())) {
+            errMsg = "Invalid trigger config or trigger type";
+        }
+        else if (req.getTriggerConfig().getTriggerType().equals(TRIGGER_TYPE_CUSTOM) &&
+            Strings.isNullOrEmpty(req.getTriggerConfig().getCustomTrigger())) {
+            errMsg = "Invalid custom trigger value";
+        }
+        else if (req.getTriggerConfig().getTriggerType().equals(TRIGGER_TYPE_SCHEDULE) &&
+            Strings.isNullOrEmpty(req.getTriggerConfig().getScheduleCron())) {
+            errMsg = "Invalid cron schedule value";
+        }
+        return Optional.ofNullable(errMsg);
+    }
+
+    public void onScalerRuleDelete(JobClusterScalerRuleProto.DeleteScalerRuleRequest req) {
+        if (logger.isTraceEnabled()) {
+            logger.trace("Enter JCA:onScalerRuleDelete {}", req);
+        }
+
+        ActorRef sender = getSender();
+        try {
+            // update local state + persist rules
+            updateAndSaveScalerRules(req);
+
+            // Forward the request to all active job actors.
+            jobManager.getJobInfoForActiveJobs()
+                .ifPresent(jobInfos -> jobInfos.forEach(
+                    ji -> ji.jobActor.forward(this.jobClusterScalerRuleData, getContext())));
+
+            sender.tell(
+                JobClusterScalerRuleProto.DeleteScalerRuleResponse.builder()
+                    .requestId(req.requestId)
+                    .responseCode(SUCCESS)
+                    .build(),
+                getSelf());
+        } catch (Exception ex) {
+            logger.error("Error updating scaler rule for {}", this.name, ex);
+            sender.tell(
+                JobClusterScalerRuleProto.CreateScalerRuleResponse.builder()
+                    .requestId(req.requestId)
+                    .responseCode(CLIENT_ERROR)
+                    .message(String.format("Could not delete scaler rule for %s due to %s", this.name, ex.getMessage()))
+                    .build(),
+                getSelf()
+            );
+        }
+
+        if (logger.isTraceEnabled()) {
+            logger.trace("Exit JCA:onScalerRuleDelete {}", req);
+        }
+    }
+
+    public void onScalerRuleGet(JobClusterScalerRuleProto.GetScalerRulesRequest req) {
+        if (logger.isTraceEnabled()) {
+            logger.trace("Enter JCA:onScalerRuleGet {}", req);
+        }
+
+        ActorRef sender = getSender();
+        sender.tell(
+            JobClusterScalerRuleProto.GetScalerRulesResponse.builder()
+                .requestId(req.requestId)
+                .responseCode(SUCCESS)
+                .rules(this.jobClusterScalerRuleData.getProtoRules())
+                .build(),
+            getSelf());
+        if (logger.isTraceEnabled()) {
+            logger.trace("Exit JCA:onScalerRuleGet {}", req);
+        }
+    }
+
+    public void onJobScalerRuleStream(JobClusterScalerRuleProto.GetJobScalerRuleStreamRequest req) {
+        if (logger.isTraceEnabled()) {
+            logger.trace("Enter JCA:onJobScalerRuleStream {}", req);
+        }
+
+        ActorRef sender = getSender();
+        try {
+            logger.debug("fwd job actor onJobScalerRuleStream {}", req);
+            Optional<JobInfo> jobInfoO = jobManager.getJobInfoForNonTerminalJob(req.getJobId());
+            if (jobInfoO.isPresent()) {
+                jobInfoO.get().jobActor.forward(req, getContext());
+            } else {
+                logger.error("Cannot find job actor onJobScalerRuleStream {}", req.getJobId());
+                sender.tell(
+                    JobClusterScalerRuleProto.GetJobScalerRuleStreamSubjectResponse.builder()
+                        .requestId(req.requestId)
+                        .responseCode(CLIENT_ERROR_NOT_FOUND)
+                        .message(String.format("Job %s not found or not active", req.getJobId()))
+                        .build(),
+                    getSelf());
+            }
+        } catch (Exception ex) {
+            logger.error("Error fwd message to job actor for {}", this.name, ex);
+            sender.tell(
+                JobClusterScalerRuleProto.GetJobScalerRuleStreamSubjectResponse.builder()
+                    .requestId(req.requestId)
+                    .responseCode(CLIENT_ERROR)
+                    .message(String.format("Could not get scaler rule stream for %s due to %s", this.name, ex.getMessage()))
+                    .build(),
+                getSelf()
+            );
+        }
+
+        if (logger.isTraceEnabled()) {
+            logger.trace("Exit JCA:onJobScalerRuleStream {}", req);
+        }
+    }
 
     static final class JobInfo  {
 
@@ -2632,10 +2849,13 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             completedJobStore.onJobClusterDeletion();
         }
 
-        Observable<JobProto.JobInitialized> bootstrapJob(MantisJobMetadataImpl jobMeta, IJobClusterMetadata jobClusterMetadata) {
+        Observable<JobProto.JobInitialized> bootstrapJob(
+            MantisJobMetadataImpl jobMeta,
+            IJobClusterMetadata jobClusterMetadata,
+            IJobClusterScalerRuleData initScalerRuleData) {
 
             // create jobInfo
-            JobInfo jobInfo = createJobInfoAndActorAndWatchActor(jobMeta, jobClusterMetadata);
+            JobInfo jobInfo = createJobInfoAndActorAndWatchActor(jobMeta, jobClusterMetadata, initScalerRuleData);
 
             // add to appropriate map
             actorToJobIdMap.put(jobInfo.jobActor, jobInfo.jobId);
@@ -2675,9 +2895,13 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
 
         }
 
-        JobInfo initJob(MantisJobMetadataImpl jobMeta, IJobClusterMetadata jobClusterMetadata, ActorRef sender) {
+        JobInfo initJob(
+            MantisJobMetadataImpl jobMeta,
+            IJobClusterMetadata jobClusterMetadata,
+            IJobClusterScalerRuleData initScalerRuleData,
+            ActorRef sender) {
 
-            JobInfo jobInfo = createJobInfoAndActorAndWatchActor(jobMeta, jobClusterMetadata);
+            JobInfo jobInfo = createJobInfoAndActorAndWatchActor(jobMeta, jobClusterMetadata, initScalerRuleData);
 
             markJobAccepted(jobInfo);
             jobInfo.jobActor.tell(new JobProto.InitJob(sender, true), context.self());
@@ -2687,11 +2911,14 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             return jobInfo;
         }
 
-        JobInfo createJobInfoAndActorAndWatchActor(MantisJobMetadataImpl jobMeta, IJobClusterMetadata jobClusterMetadata) {
+        JobInfo createJobInfoAndActorAndWatchActor(
+            MantisJobMetadataImpl jobMeta,
+            IJobClusterMetadata jobClusterMetadata,
+            IJobClusterScalerRuleData initScalerRuleData) {
 
             MantisScheduler scheduler1 = scheduler.forJob(jobMeta.getJobDefinition());
             ActorRef jobActor = context.actorOf(JobActor.props(jobClusterMetadata.getJobClusterDefinition(),
-                    jobMeta, jobStore, scheduler1, publisher, costsCalculator), "JobActor-" + jobMeta.getJobId().getId());
+                    jobMeta, jobStore, scheduler1, publisher, costsCalculator, initScalerRuleData), "JobActor-" + jobMeta.getJobId().getId());
 
 
             context.watch(jobActor);
@@ -3008,6 +3235,23 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
 
         }
 
+        Optional<List<JobInfo>> getJobInfoForActiveJobs() {
+            List<JobInfo> activeJobs = new ArrayList<>();
+            if(!acceptedJobsMap.isEmpty()) {
+                activeJobs.addAll(acceptedJobsMap.values());
+            }
+
+            if(!activeJobsMap.isEmpty()) {
+                activeJobs.addAll(activeJobsMap.values());
+            }
+
+            if (!activeJobs.isEmpty()) {
+                return Optional.of(activeJobs);
+            } else {
+                return Optional.empty();
+            }
+        }
+
         private List<JobInfo> getJobActorsStuckInInit(long now, long allowedDelay) {
             return getPendingInitializationJobsPriorToCutoff(now - allowedDelay)
                     .stream()
@@ -3235,7 +3479,7 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
                 isCronActive = true;
             } catch (IllegalArgumentException e) {
                 destroyCron();
-                logger.error("Failed to start cron for {}: {}", jobClusterName, e);
+                logger.error("Failed to start cron for {}: {}. The format of the cron schedule may be incorrect.", jobClusterName, e.getStackTrace());
                 throw new SchedulerException(e.getMessage(), e);
             }
 
@@ -3245,9 +3489,9 @@ public class JobClusterActor extends AbstractActorWithTimers implements IJobClus
             try {
                 if (triggerId != null) {
                     logger.info("Destroying cron " + triggerId);
-                    triggerId = null;
                     isCronActive = false;
                     triggerOperator.deleteTrigger(triggerGroup, triggerId);
+                    triggerId = null;
                 }
             } catch (TriggerNotFoundException | SchedulerException e) {
                 logger.warn("Couldn't delete trigger group " + triggerGroup + ", id " + triggerId);

@@ -173,18 +173,14 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
 
     private void onFailedToBatchScheduleRequestEvent(FailedToBatchScheduleRequestEvent event) {
         batchSchedulingFailures.increment();
-        if (event.getAttempt() >= this.maxScheduleRetries) {
-            log.error("Failed to submit the batch request {} because of ", event.getScheduleRequestEvent(), event.getThrowable());
-        } else {
-            Duration timeout = Duration.ofMillis(intervalBetweenRetries.toMillis());
-            log.error("Failed to submit the request {}; Retrying in {} because of ",
-                event.getScheduleRequestEvent(), timeout, event.getThrowable());
+        Duration timeout = Duration.ofMillis(intervalBetweenRetries.toMillis());
+        log.warn("BatchScheduleRequest failed to allocate resource: {}; Retrying in {} because of ",
+            event.getScheduleRequestEvent(), timeout, event.getThrowable());
 
-            getTimers().startSingleTimer(
-                getBatchSchedulingQueueKeyFor(event.getScheduleRequestEvent().getJobId()),
-                event.onRetry(),
-                timeout);
-        }
+        getTimers().startSingleTimer(
+            getBatchSchedulingQueueKeyFor(event.getScheduleRequestEvent().getJobId()),
+            event.onRetry(),
+            timeout);
     }
 
     private void onScheduleRequestEvent(ScheduleRequestEvent event) {
@@ -197,7 +193,7 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
             resourceCluster
                 .getTaskExecutorsFor(
                     Collections.singleton(TaskExecutorAllocationRequest.of(
-                        event.getRequest().getWorkerId(), event.getRequest().getMachineDefinition(), event.getRequest().getJobMetadata(), event.getRequest().getStageNum())))
+                        event.getRequest().getWorkerId(), event.getRequest().getSchedulingConstraints(), event.getRequest().getJobMetadata(), event.getRequest().getStageNum())))
                 .<Object>thenApply(allocation -> event.onAssignment(allocation.values().stream().findFirst().get()))
                 .exceptionally(event::onFailure);
 
@@ -292,7 +288,7 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
         try {
             final TaskExecutorRegistration info = resourceCluster.getTaskExecutorInfo(taskExecutorID)
                 .join();
-            boolean success =
+            boolean success = //todo this return state is not wired to actual processing
                 jobMessageRouter.routeWorkerEvent(new WorkerLaunched(
                     event.getEvent().getRequest().getWorkerId(),
                     event.getEvent().getRequest().getStageNum(),
@@ -312,6 +308,7 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
             }
         } catch (Exception ex) {
             log.warn("Failed to route message due to error in getting TaskExecutor info: {}", taskExecutorID, ex);
+            self().tell(event.onFailure(ex), self());
         }
     }
 
@@ -363,6 +360,11 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
     }
 
     private void onRetryCancelRequestEvent(RetryCancelRequestEvent event) {
+        // mark target as cancelled in resource cluster actor
+        CompletableFuture<Ack> markCancelledFuture =
+            this.resourceCluster.markTaskExecutorWorkerCancelled(event.getWorkerId());
+        pipe(markCancelledFuture, context().dispatcher()).to(self());
+
         if (event.getActualEvent().getAttempt() < maxCancelRetries) {
             context().system()
                 .scheduler()
@@ -402,7 +404,7 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
             this.allocationRequestScheduleRequestMap = request
                 .getScheduleRequests()
                 .stream()
-                .map(req -> Pair.of(req, TaskExecutorAllocationRequest.of(req.getWorkerId(), req.getMachineDefinition(), req.getJobMetadata(), req.getStageNum())))
+                .map(req -> Pair.of(req, TaskExecutorAllocationRequest.of(req.getWorkerId(), req.getSchedulingConstraints(), req.getJobMetadata(), req.getStageNum())))
                 .collect(Collectors.toMap(Pair::getRight, Pair::getLeft));
         }
 
@@ -519,6 +521,11 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
 
         ScheduleRequestEvent event;
         TaskExecutorID taskExecutorID;
+
+        FailedToScheduleRequestEvent onFailure(Throwable throwable) {
+            return new FailedToScheduleRequestEvent(
+                this.event, 1, ExceptionUtils.stripCompletionException(throwable));
+        }
     }
 
     @Value
@@ -563,6 +570,10 @@ class ResourceClusterAwareSchedulerActor extends AbstractActorWithTimers {
         CancelRequestEvent onRetry() {
             return new CancelRequestEvent(actualEvent.getWorkerId(),
                 actualEvent.getAttempt() + 1, currentFailure);
+        }
+
+        WorkerId getWorkerId() {
+            return actualEvent.getWorkerId();
         }
     }
 

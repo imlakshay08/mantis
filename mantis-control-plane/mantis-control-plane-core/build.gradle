@@ -22,7 +22,6 @@ ext {
     hdrHistogramVersion = '2.+'
     jodaTimeVersion = '2.+'
     jsonVersion = '20180813'
-    mesosVersion = '1.7.2'
     testngVersion = '6.14.+'
 }
 
@@ -34,10 +33,10 @@ dependencies {
     api libraries.flinkRpcApi
     api libraries.flinkCore
     implementation libraries.commonsIo
+    implementation libraries.vavr
     compileOnly libraries.jsr305
     compileOnly libraries.flinkRpcImpl // Provided by copyLibs task
 
-    api "org.apache.mesos:mesos:$mesosVersion"
     api "org.json:json:$jsonVersion"
     api "org.hdrhistogram:HdrHistogram:$hdrHistogramVersion"
     api "com.github.spullara.cli-parser:cli-parser:$cliParserVersion"
@@ -45,7 +44,7 @@ dependencies {
 
     testFixturesImplementation libraries.flinkRpcImpl
     testImplementation libraries.junit4
-    testImplementation libraries.mockitoAll
+    testImplementation libraries.mockitoCore
 }
 
 // This task makes flink-rpc-akka.jar available in mantis-control-plane-core classpath,
@@ -60,3 +59,11 @@ task copyLibs(type: Copy) {
 }
 
 jar.dependsOn copyLibs
+compileTestFixturesJava.dependsOn copyLibs
+
+tasks.withType(Test) {
+    jvmArgs += [
+        '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.util=ALL-UNNAMED'
+    ]
+}

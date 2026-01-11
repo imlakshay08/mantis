@@ -80,6 +80,7 @@ public class ExecuteStageRequest implements Serializable {
     @Nullable
     private final String nameOfJobProviderClass;
     private final String user;
+    private final String jobVersion;
 
     @JsonCreator
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -102,7 +103,8 @@ public class ExecuteStageRequest implements Serializable {
         @JsonProperty("minRuntimeSecs") long minRuntimeSecs,
         @JsonProperty("workerPorts") WorkerPorts workerPorts,
         @JsonProperty("nameOfJobProviderClass") Optional<String> nameOfJobProviderClass,
-        @JsonProperty("user") String user) {
+        @JsonProperty("user") String user,
+        @JsonProperty("jobVersion") String jobVersion) {
         this.jobName = jobName;
         this.jobId = jobId;
         this.workerIndex = workerIndex;
@@ -123,11 +125,12 @@ public class ExecuteStageRequest implements Serializable {
         this.schedulingInfo = schedulingInfo;
         this.durationType = durationType;
         this.heartbeatIntervalSecs = (heartbeatIntervalSecs > 0) ? heartbeatIntervalSecs : DEFAULT_HEARTBEAT_INTERVAL_SECS;
-        log.info("heartbeat interval {}, using {}", heartbeatIntervalSecs, this.heartbeatIntervalSecs);
+        log.debug("heartbeat interval {}, using {}", heartbeatIntervalSecs, this.heartbeatIntervalSecs);
         this.hasJobMaster = schedulingInfo != null && schedulingInfo.forStage(0) != null;
         this.subscriptionTimeoutSecs = subscriptionTimeoutSecs;
         this.minRuntimeSecs = minRuntimeSecs;
         this.workerPorts = workerPorts;
+        this.jobVersion = jobVersion;
     }
 
     public boolean getHasJobMaster() {

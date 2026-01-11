@@ -20,6 +20,7 @@ import io.mantisrx.master.jobcluster.IJobClusterMetadata;
 import io.mantisrx.master.jobcluster.job.IMantisJobMetadata;
 import io.mantisrx.master.jobcluster.job.IMantisStageMetadata;
 import io.mantisrx.master.jobcluster.job.worker.IMantisWorkerMetadata;
+import io.mantisrx.master.jobcluster.scaler.IJobClusterScalerRuleData;
 import io.mantisrx.master.resourcecluster.DisableTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.proto.ResourceClusterScaleSpec;
 import io.mantisrx.master.resourcecluster.writable.RegisteredResourceClustersWritable;
@@ -119,7 +120,7 @@ public interface IMantisPersistenceProvider {
     /**
      * Initialize and return all existing NamedJobs from persistence.
      *
-     * @return List of {@link NamedJob} objects.
+     * @return List of {@link io.mantisrx.server.master.store.NamedJob} objects.
      * @throws IOException Upon error connecting to or reading from persistence.
      */
     List<IJobClusterMetadata> loadAllJobClusters() throws IOException;
@@ -150,6 +151,9 @@ public interface IMantisPersistenceProvider {
     void deleteCompletedJobsForCluster(String name) throws IOException;
 
     Optional<IMantisJobMetadata> loadArchivedJob(String jobId) throws IOException;
+
+    void updateJobClusterScalerRule(IJobClusterScalerRuleData scalerRuleData) throws Exception;
+    IJobClusterScalerRuleData getJobClusterScalerRuleData(String jobClusterName) throws IOException;
 
     //////////////////////////////////
 

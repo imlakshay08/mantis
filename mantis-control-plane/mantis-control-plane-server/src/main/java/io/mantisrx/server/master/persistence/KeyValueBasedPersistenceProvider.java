@@ -25,11 +25,14 @@ import io.mantisrx.master.jobcluster.job.IMantisJobMetadata;
 import io.mantisrx.master.jobcluster.job.IMantisStageMetadata;
 import io.mantisrx.master.jobcluster.job.worker.IMantisWorkerMetadata;
 import io.mantisrx.master.jobcluster.job.worker.JobWorker;
+import io.mantisrx.master.jobcluster.scaler.IJobClusterScalerRuleData;
+import io.mantisrx.master.jobcluster.scaler.JobClusterScalerRuleDataImplWritable;
 import io.mantisrx.master.resourcecluster.DisableTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.proto.ResourceClusterScaleSpec;
 import io.mantisrx.master.resourcecluster.writable.RegisteredResourceClustersWritable;
 import io.mantisrx.master.resourcecluster.writable.ResourceClusterScaleRulesWritable;
 import io.mantisrx.master.resourcecluster.writable.ResourceClusterSpecWritable;
+import io.mantisrx.server.core.IKeyValueStore;
 import io.mantisrx.server.core.domain.ArtifactID;
 import io.mantisrx.server.core.domain.JobArtifact;
 import io.mantisrx.server.master.domain.DataFormatAdapter;
@@ -38,7 +41,6 @@ import io.mantisrx.server.master.domain.JobId;
 import io.mantisrx.server.master.resourcecluster.ClusterID;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorID;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorRegistration;
-import io.mantisrx.server.master.store.KeyValueStore;
 import io.mantisrx.server.master.store.MantisJobMetadataWritable;
 import io.mantisrx.server.master.store.MantisStageMetadata;
 import io.mantisrx.server.master.store.MantisStageMetadataWritable;
@@ -108,6 +110,7 @@ public class KeyValueBasedPersistenceProvider implements IMantisPersistenceProvi
     private static final String NAMED_COMPLETEDJOBS_NS = "MantisNamedJobCompletedJobsV2";
     private static final String ACTIVE_ASGS_NS = "MantisActiveASGs";
     private static final String TASK_EXECUTOR_REGISTRATION = "TaskExecutorRegistration";
+    private static final String JOB_CLUSTER_SCALER_RULE = "JobClusterScalerRule";
     private static final String DISABLE_TASK_EXECUTOR_REQUESTS = "MantisDisableTaskExecutorRequests";
     private static final String CONTROLPLANE_NS = "mantis_controlplane";
     private static final String JOB_ARTIFACTS_NS = "mantis_global_job_artifacts";
@@ -129,14 +132,14 @@ public class KeyValueBasedPersistenceProvider implements IMantisPersistenceProvi
             .registerModule(new JavaTimeModule());
     }
 
-    private final KeyValueStore kvStore;
+    private final IKeyValueStore kvStore;
     private final LifecycleEventPublisher eventPublisher;
     private final Counter noWorkersFoundCounter;
     private final Counter staleWorkersFoundCounter;
     private final Counter workersFoundCounter;
     private final Counter failedToLoadJobCounter;
 
-    public KeyValueBasedPersistenceProvider(KeyValueStore kvStore, LifecycleEventPublisher eventPublisher) {
+    public KeyValueBasedPersistenceProvider(IKeyValueStore kvStore, LifecycleEventPublisher eventPublisher) {
         this.kvStore = kvStore;
         this.eventPublisher = eventPublisher;
         Metrics m = new Metrics.Builder()
@@ -386,9 +389,11 @@ public class KeyValueBasedPersistenceProvider implements IMantisPersistenceProvi
                 })
                 .filter(Objects::nonNull)
                 .collect(Collectors.toList());
-            workersByJobId
-                .computeIfAbsent(workers.get(0).getJobId(), k -> Lists.newArrayList())
-                .addAll(workers);
+            if(!workers.isEmpty()) {
+                workersByJobId
+                    .computeIfAbsent(workers.get(0).getJobId(), k -> Lists.newArrayList())
+                    .addAll(workers);
+            }
         }
         return workersByJobId;
     }
@@ -498,9 +503,11 @@ public class KeyValueBasedPersistenceProvider implements IMantisPersistenceProvi
                 items = kvStore.getAll(ARCHIVED_WORKERS_NS, pkey);
                 for (Map.Entry<String, String> entry : items.entrySet()) {
                     try {
-                        final JobWorker jobWorker = DataFormatAdapter.convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(
-                            mapper.readValue(entry.getValue(), MantisWorkerMetadataWritable.class),
-                            eventPublisher);
+                        final JobWorker jobWorker =
+                            DataFormatAdapter.convertMantisWorkerMetadataWriteableToMantisWorkerMetadata(
+                                mapper.readValue(entry.getValue(), MantisWorkerMetadataWritable.class),
+                                eventPublisher,
+                                true);
                         archivedWorkers.add(jobWorker.getMetadata());
                     } catch (Exception e) {
                         logger.warn("Exception converting worker for jobId {} ({}, {})", jobId, pkey, entry.getKey(), e);
@@ -602,6 +609,33 @@ public class KeyValueBasedPersistenceProvider implements IMantisPersistenceProvi
             logger.error("Exception loading archived job {}", jobId, e);
         }
         return Optional.empty();
+    }
+
+    @Override
+    public void updateJobClusterScalerRule(IJobClusterScalerRuleData scalerRuleData) throws IOException {
+        try {
+            final String resourceId = scalerRuleData.getJobClusterName();
+            // todo: evaluate whether to create new NS.
+            final String keyId = String.format("%s-%s", JOB_CLUSTER_SCALER_RULE, resourceId);
+            kvStore.upsert(CONTROLPLANE_NS, keyId, resourceId,
+                mapper.writeValueAsString(DataFormatAdapter.convertJobClusterScalerRuleDataToWritable(scalerRuleData)));
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
+    }
+
+    @Override
+    public IJobClusterScalerRuleData getJobClusterScalerRuleData(String jobClusterName) throws IOException {
+        try {
+            final String value =
+                kvStore.get(CONTROLPLANE_NS,
+                    JOB_CLUSTER_SCALER_RULE + "-" + jobClusterName,
+                    jobClusterName);
+
+            return value == null ? null : mapper.readValue(value, JobClusterScalerRuleDataImplWritable.class);
+        } catch (Exception e) {
+            throw new IOException(e);
+        }
     }
 
     @Override

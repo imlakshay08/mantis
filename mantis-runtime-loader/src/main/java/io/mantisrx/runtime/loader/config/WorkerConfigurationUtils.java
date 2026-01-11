@@ -48,11 +48,15 @@ public class WorkerConfigurationUtils {
             .isLocalMode(configSource.isLocalMode())
             .leaderAnnouncementPath(configSource.getLeaderAnnouncementPath())
             .localStorageDir(configSource.getLocalStorageDir())
-            .mesosSlavePort(configSource.getMesosSlavePort())
             .metricsCollector(configSource.getUsageSupplier())
+            .metricsCollectorClass(configSource.getMetricsCollectorClassName())
+            .jobAutoscalerManagerClassName(configSource.getJobAutoscalerManagerClassName())
             .metricsPort(configSource.getMetricsPort())
             .metricsPublisher(configSource.getMetricsPublisher())
             .metricsPublisherFrequencyInSeconds(configSource.getMetricsPublisherFrequencyInSeconds())
+            .cpuCores(configSource.getCpuCores())
+            .memoryInMB(configSource.getMemoryInMB())
+            .diskInMB(configSource.getDiskInMB())
             .networkBandwidthInMB(configSource.getNetworkBandwidthInMB())
             .sinkPort(configSource.getSinkPort())
             .taskExecutorId(configSource.getTaskExecutorId())
@@ -62,6 +66,7 @@ public class WorkerConfigurationUtils {
             .zkConnectionString(configSource.getZkConnectionString())
             .zkConnectionRetrySleepMs(configSource.getZkConnectionRetrySleepMs())
             .zkRoot(configSource.getZkRoot())
+            .leaderMonitorFactory(configSource.getLeaderMonitorFactoryName())
             .build();
     }
 

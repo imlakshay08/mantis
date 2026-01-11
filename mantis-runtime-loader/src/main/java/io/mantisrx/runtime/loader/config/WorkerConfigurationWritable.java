@@ -17,6 +17,8 @@
 package io.mantisrx.runtime.loader.config;
 
 import io.mantisrx.common.metrics.MetricsPublisher;
+import io.mantisrx.server.core.ILeaderMonitorFactory;
+import io.mantisrx.server.core.utils.ConfigUtils;
 import io.mantisrx.shaded.com.fasterxml.jackson.annotation.JsonIgnore;
 import java.io.File;
 import java.net.URI;
@@ -31,7 +33,6 @@ import lombok.Data;
 @Builder
 public class WorkerConfigurationWritable implements WorkerConfiguration {
 
-    int mesosSlavePort;
     int zkConnectionTimeoutMs;
     int zkConnectionRetrySleepMs;
     int zkConnectionMaxRetries;
@@ -65,12 +66,19 @@ public class WorkerConfigurationWritable implements WorkerConfiguration {
 
     URI blobStoreArtifactDir;
     File localStorageDir;
+    Double cpuCores;
+    Double memoryInMB;
+    Double diskInMB;
     double networkBandwidthInMB;
     String taskExecutorAttributesStr;
     int asyncHttpClientMaxConnectionsPerHost;
     int asyncHttpClientConnectionTimeoutMs;
     int asyncHttpClientRequestTimeoutMs;
     int asyncHttpClientReadTimeoutMs;
+    boolean asyncHttpClientFollowRedirect;
+    String leaderMonitorFactory;
+    String metricsCollectorClass;
+    String jobAutoscalerManagerClassName;
 
     @JsonIgnore
     MetricsPublisher metricsPublisher;
@@ -124,8 +132,15 @@ public class WorkerConfigurationWritable implements WorkerConfiguration {
     }
 
     @Override
-    public int getMesosSlavePort() {
-        return this.mesosSlavePort;
+    public boolean getAsyncHttpClientFollowRedirect() {
+        return this.asyncHttpClientFollowRedirect;
+    }
+
+    @Override
+    public String getLeaderMonitorFactoryName() {return this.leaderMonitorFactory;}
+
+    public ILeaderMonitorFactory getLeaderMonitorFactoryImpl() {
+        return ConfigUtils.createInstance(this.leaderMonitorFactory, ILeaderMonitorFactory.class);
     }
 
     @Override
@@ -161,6 +176,11 @@ public class WorkerConfigurationWritable implements WorkerConfiguration {
     @Override
     public int getSinkPort() {
         return this.sinkPort;
+    }
+
+    @Override
+    public String getMetricsCollectorClassName() {
+        return this.metricsCollectorClass;
     }
 
     @Override
@@ -241,6 +261,21 @@ public class WorkerConfigurationWritable implements WorkerConfiguration {
     @Override
     public File getLocalStorageDir() {
         return this.localStorageDir;
+    }
+
+    @Override
+    public Double getCpuCores() {
+        return this.cpuCores;
+    }
+
+    @Override
+    public Double getMemoryInMB() {
+        return this.memoryInMB;
+    }
+
+    @Override
+    public Double getDiskInMB() {
+        return this.diskInMB;
     }
 
     @Override

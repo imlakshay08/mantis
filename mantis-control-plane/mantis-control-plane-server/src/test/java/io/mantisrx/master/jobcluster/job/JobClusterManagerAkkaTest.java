@@ -30,6 +30,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.eq;
 import static org.mockito.Mockito.mock;
@@ -89,6 +90,7 @@ import io.mantisrx.server.core.domain.WorkerId;
 import io.mantisrx.server.master.domain.IJobClusterDefinition;
 import io.mantisrx.server.master.domain.JobClusterConfig;
 import io.mantisrx.server.master.domain.JobClusterDefinitionImpl;
+import io.mantisrx.server.master.domain.JobClusterDefinitionImpl.CompletedJob;
 import io.mantisrx.server.master.domain.JobDefinition;
 import io.mantisrx.server.master.domain.JobId;
 import io.mantisrx.server.master.domain.SLA;
@@ -99,6 +101,7 @@ import io.mantisrx.server.master.scheduler.MantisSchedulerFactory;
 import io.mantisrx.server.master.scheduler.WorkerEvent;
 import io.mantisrx.server.master.scheduler.WorkerLaunched;
 import io.mantisrx.server.master.store.FileBasedStore;
+import io.mantisrx.shaded.com.google.common.collect.ImmutableList;
 import io.mantisrx.shaded.com.google.common.collect.Lists;
 import java.io.IOException;
 import java.net.MalformedURLException;
@@ -162,7 +165,8 @@ public class JobClusterManagerAkkaTest {
         jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreMock,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
             true), ActorRef.noSender());
@@ -185,10 +189,14 @@ public class JobClusterManagerAkkaTest {
         final String name,
         List<Label> labels,
         WorkerMigrationConfig migrationConfig) {
+        String artifactName = "myart";
+        if (labels.stream().noneMatch(l -> l.getName().equals("_mantis.resourceCluster"))) {
+            labels.add(new Label("_mantis.resourceCluster", "akkaTestCluster1"));
+        }
 
         JobClusterConfig clusterConfig = new JobClusterConfig.Builder()
-            .withArtifactName("myart")
-
+            .withJobJarUrl("http://" + artifactName)
+            .withArtifactName(artifactName)
             .withSchedulingInfo(new SchedulingInfo.Builder().numberOfStages(1)
                 .singleWorkerStageWithConstraints(
                     new MachineDefinition(
@@ -234,6 +242,7 @@ public class JobClusterManagerAkkaTest {
                     Lists.newArrayList(),
                     Lists.newArrayList())
                 .build())
+            .withJobJarUrl("http://myart")
             .withArtifactName("myart")
             .withSubscriptionTimeoutSecs(0)
             .withUser("njoshi")
@@ -302,7 +311,8 @@ public class JobClusterManagerAkkaTest {
         ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
             true), probe.getRef());
@@ -322,7 +332,8 @@ public class JobClusterManagerAkkaTest {
         jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStore,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         // initialize it
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
@@ -377,7 +388,8 @@ public class JobClusterManagerAkkaTest {
         ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
             true), probe.getRef());
@@ -403,7 +415,8 @@ public class JobClusterManagerAkkaTest {
         ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
             false), probe.getRef());
@@ -504,7 +517,6 @@ public class JobClusterManagerAkkaTest {
             Duration.of(10, ChronoUnit.MINUTES),
             GetJobDetailsResponse.class);
 
-        System.out.println("[fdc-92] acceptedResponse -> " + acceptedResponse);
         // Ensure its Accepted
         assertEquals(SUCCESS, acceptedResponse.responseCode);
         assertEquals(JobState.Accepted, acceptedResponse.getJobMetadata().get().getState());
@@ -522,7 +534,8 @@ public class JobClusterManagerAkkaTest {
         jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         // initialize it
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
@@ -578,7 +591,6 @@ public class JobClusterManagerAkkaTest {
         resp2 = probe.expectMsgClass(Duration.of(10, ChronoUnit.MINUTES),
             GetJobDetailsResponse.class);
 
-        System.out.println("[fdc-92] resp -> " + resp2);
         // Ensure its Accepted
         assertEquals(SUCCESS, resp2.responseCode);
         assertEquals(JobState.Accepted, resp2.getJobMetadata().get().getState());
@@ -666,7 +678,8 @@ public class JobClusterManagerAkkaTest {
         ActorRef jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
             false), probe.getRef());
@@ -744,7 +757,8 @@ public class JobClusterManagerAkkaTest {
         jobClusterManagerActor = system.actorOf(JobClustersManagerActor.props(
             jobStoreSpied,
             eventPublisher,
-            costsCalculator));
+            costsCalculator,
+            0));
         // initialize it
         jobClusterManagerActor.tell(new JobClusterManagerProto.JobClustersManagerInitialize(
             schedulerMockFactory,
@@ -1001,6 +1015,7 @@ public class JobClusterManagerAkkaTest {
         List<Label> labels = Lists.newLinkedList();
         Label l = new Label("labelname", "labelvalue");
         labels.add(l);
+        labels.add(new Label("_mantis.resourceCluster", "cl2"));
         final JobClusterDefinitionImpl fakeJobCluster = createFakeJobClusterDefn(
             clusterName,
             labels);
@@ -1012,8 +1027,10 @@ public class JobClusterManagerAkkaTest {
             JobClusterManagerProto.CreateJobClusterResponse.class);
         assertEquals(SUCCESS_CREATED, createResp.responseCode);
 
+        String artifactName = "myart2";
         JobClusterConfig clusterConfig = new JobClusterConfig.Builder()
-            .withArtifactName("myart2")
+            .withJobJarUrl("http://" + artifactName)
+            .withArtifactName(artifactName)
             .withSchedulingInfo(TWO_WORKER_SCHED_INFO)
             .withVersion("0.0.2")
             .build();
@@ -1022,7 +1039,7 @@ public class JobClusterManagerAkkaTest {
             .withJobClusterConfig(clusterConfig)
             .withName(clusterName)
             .withParameters(Lists.newArrayList())
-
+            .withLabels(labels)
             .withUser(user)
             .withIsReadyForJobMaster(true)
             .withOwner(DEFAULT_JOB_OWNER)
@@ -1110,6 +1127,7 @@ public class JobClusterManagerAkkaTest {
         List<Label> labels2 = Lists.newLinkedList();
         Label l = new Label("labelname", "labelvalue");
         labels2.add(l);
+        labels2.add(new Label("_mantis.resourceCluster", "cl2"));
 
         UpdateJobClusterLabelsRequest req = new JobClusterManagerProto.UpdateJobClusterLabelsRequest(
             clusterName,
@@ -1123,7 +1141,7 @@ public class JobClusterManagerAkkaTest {
         jobClusterManagerActor.tell(new GetJobClusterRequest(clusterName), probe.getRef());
         GetJobClusterResponse getResp = probe.expectMsgClass(GetJobClusterResponse.class);
         assertEquals(SUCCESS, getResp.responseCode);
-        assertEquals(1, getResp.getJobCluster().get().getLabels().size());
+        assertEquals(2, getResp.getJobCluster().get().getLabels().size());
         assertEquals(l, getResp.getJobCluster().get().getLabels().get(0));
     }
 
@@ -1146,6 +1164,7 @@ public class JobClusterManagerAkkaTest {
         UpdateJobClusterArtifactRequest req = new JobClusterManagerProto.UpdateJobClusterArtifactRequest(
             clusterName,
             "myjar",
+            "http://myjar",
             "1.0.1",
             true,
             "user");
@@ -1409,15 +1428,21 @@ public class JobClusterManagerAkkaTest {
 
             assertEquals(SUCCESS, getLastSubmittedJobIdStreamResponse.responseCode);
 
-            CountDownLatch jobIdLatch = new CountDownLatch(1);
+            CountDownLatch jobIdLatch = new CountDownLatch(2);
             assertTrue(getLastSubmittedJobIdStreamResponse.getjobIdBehaviorSubject().isPresent());
             BehaviorSubject<JobId> jobIdBehaviorSubject =
                 getLastSubmittedJobIdStreamResponse.getjobIdBehaviorSubject().get();
 
             jobIdBehaviorSubject.subscribeOn(Schedulers.io()).subscribe((jId) -> {
                 System.out.println("Got Jid -> " + jId);
-                assertEquals(clusterName + "-1", jId.getId());
-                jobIdLatch.countDown();
+                if (jId.getId().endsWith("1")) {
+                    assertEquals(clusterName + "-1", jId.getId());
+                    jobIdLatch.countDown();
+                }
+                else if (jId.getId().endsWith("2")) {
+                    assertEquals(clusterName + "-2", jId.getId());
+                    jobIdLatch.countDown();
+                }
             });
 
             jobDefn = createJob(clusterName);
@@ -1430,9 +1455,62 @@ public class JobClusterManagerAkkaTest {
             JobClusterManagerProto.SubmitJobResponse submitResp = probe.expectMsgClass(
                 JobClusterManagerProto.SubmitJobResponse.class);
             assertEquals(SUCCESS, submitResp.responseCode);
+            assertTrue(submitResp.getJobId().isPresent());
 
-            jobIdLatch.await(1, TimeUnit.SECONDS);
+            // mark job as launched
+            WorkerId workerId = new WorkerId(submitResp.getJobId().get().getId(), 0, 1);
+            WorkerEvent startEvent = new WorkerHeartbeat(new Status(
+                submitResp.getJobId().get().getId(),
+                1,
+                workerId.getWorkerIndex(),
+                workerId.getWorkerNum(),
+                TYPE.HEARTBEAT,
+                "",
+                MantisJobState.Started));
+            WorkerEvent launchEvent = new WorkerLaunched(
+                workerId,
+                1,
+                "hostname",
+                "vmid1",
+                Optional.empty(),
+                Optional.empty(),
+                new WorkerPorts(1, 2, 3, 4, 5));
 
+            jobClusterManagerActor.tell(launchEvent, probe.getRef());
+            jobClusterManagerActor.tell(startEvent, probe.getRef());
+
+            jobClusterManagerActor.tell(
+                new JobClusterManagerProto.SubmitJobRequest(
+                    clusterName,
+                    "me",
+                    jobDefn),
+                probe.getRef());
+            submitResp = probe.expectMsgClass(
+                JobClusterManagerProto.SubmitJobResponse.class);
+            assertEquals(SUCCESS, submitResp.responseCode);
+            assertTrue(submitResp.getJobId().isPresent());
+            workerId = new WorkerId(submitResp.getJobId().get().getId(), 0, 1);
+            startEvent = new WorkerHeartbeat(new Status(
+                submitResp.getJobId().get().getId(),
+                1,
+                workerId.getWorkerIndex(),
+                workerId.getWorkerNum(),
+                TYPE.HEARTBEAT,
+                "",
+                MantisJobState.Started));
+            launchEvent = new WorkerLaunched(
+                workerId,
+                1,
+                "hostname",
+                "vmid1",
+                Optional.empty(),
+                Optional.empty(),
+                new WorkerPorts(1, 2, 3, 4, 5));
+
+            jobClusterManagerActor.tell(launchEvent, probe.getRef());
+            jobClusterManagerActor.tell(startEvent, probe.getRef());
+
+            assertTrue(jobIdLatch.await(10, TimeUnit.SECONDS));
             // try a non existent cluster
             jobClusterManagerActor.tell(
                 new GetLastSubmittedJobIdStreamRequest("randomC"),
@@ -1521,7 +1599,7 @@ public class JobClusterManagerAkkaTest {
     }
 
     @Test
-    public void testNonTerminalEventFromZombieWorkerLeadsToTermination() {
+    public void testNonTerminalEventFromZombieWorkerLeadsToTermination() throws IOException {
         TestKit probe = new TestKit(system);
         String clusterName = "testNonTerminalEventFromZombieWorkerLeadsToTermination";
 
@@ -1537,6 +1615,18 @@ public class JobClusterManagerAkkaTest {
         assertEquals(SUCCESS_CREATED, resp.responseCode);
 
         WorkerId zWorker1 = new WorkerId("randomCluster", "randomCluster-1", 0, 1);
+        when(jobStoreMock.loadCompletedJobsForCluster(any(), anyInt(), any()))
+            // .thenReturn(ImmutableList.of());
+            .thenReturn(ImmutableList.of(
+                new CompletedJob(
+                    clusterName,
+                    clusterName + "-1",
+                    "v1",
+                    JobState.Completed,
+                    -1L,
+                    -1L,
+                    "ut",
+                    ImmutableList.of())));
         when(jobStoreMock.getArchivedJob(zWorker1.getJobId()))
             .thenReturn(Optional.of(
                 new MantisJobMetadataImpl.Builder().withJobDefinition(mock(JobDefinition.class))

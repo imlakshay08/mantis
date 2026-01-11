@@ -23,18 +23,13 @@ import io.mantisrx.shaded.com.google.common.collect.ImmutableMap;
 import java.io.File;
 import java.net.URI;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.flink.api.common.time.Time;
 import org.skife.config.Config;
 import org.skife.config.Default;
 import org.skife.config.DefaultNull;
 
 public interface WorkerConfiguration extends CoreConfiguration {
-
-    // Old configurations for mesos
-    @Config("mantis.agent.mesos.slave.port")
-    @Default("5051")
-    int getMesosSlavePort();
-
     // ------------------------------------------------------------------------
     //  Task Executor machine related configurations
     // ------------------------------------------------------------------------
@@ -70,6 +65,14 @@ public interface WorkerConfiguration extends CoreConfiguration {
     @Default("5055")
     int getSinkPort();
 
+    @Config("mantis.taskexecutor.metrics.collector")
+    @Default("io.mantisrx.runtime.loader.cgroups.CgroupsMetricsCollector")
+    String getMetricsCollectorClassName();
+
+    @Config("mantis.taskexecutor.runtime.jobautoscalermanager")
+    @Default("io.mantisrx.server.worker.jobmaster.NoopJobAutoscalerManager")
+    String getJobAutoscalerManagerClassName();
+
     // ------------------------------------------------------------------------
     //  heartbeat connection related configurations
     // ------------------------------------------------------------------------
@@ -82,7 +85,7 @@ public interface WorkerConfiguration extends CoreConfiguration {
     int getTolerableConsecutiveHeartbeatFailures();
 
     @Config("mantis.taskexecutor.heartbeats.timeout.ms")
-    @Default("5000")
+    @Default("90000")
     int heartbeatTimeoutMs();
 
     @Config("mantis.taskexecutor.heartbeats.retry.initial-delay.ms")
@@ -141,7 +144,7 @@ public interface WorkerConfiguration extends CoreConfiguration {
     Integer getBindPort();
 
     @Config("mantis.taskexecutor.metrics.collector")
-    @Default("io.mantisrx.server.worker.mesos.MesosMetricsCollector")
+    @Default("io.mantisrx.runtime.loader.cgroups.CgroupsMetricsCollector")
     MetricsCollector getUsageSupplier();
 
     // ------------------------------------------------------------------------
@@ -154,6 +157,18 @@ public interface WorkerConfiguration extends CoreConfiguration {
     @Config("mantis.taskexecutor.blob-store.local-cache")
     @DefaultNull
     File getLocalStorageDir();
+
+    @Config("mantis.taskexecutor.hardware.cpu-cores")
+    @DefaultNull
+    Double getCpuCores();
+
+    @Config("mantis.taskexecutor.hardware.memory-in-mb")
+    @DefaultNull
+    Double getMemoryInMB();
+
+    @Config("mantis.taskexecutor.hardware.disk-in-mb")
+    @DefaultNull
+    Double getDiskInMB();
 
     @Config("mantis.taskexecutor.hardware.network-bandwidth-in-mb")
     @Default(value = "128.0")
@@ -170,6 +185,11 @@ public interface WorkerConfiguration extends CoreConfiguration {
             return ImmutableMap.of();
         }
 
-        return Splitter.on(",").withKeyValueSeparator(':').split(input);
+        Map<String, String> attributes = Splitter.on(",").withKeyValueSeparator(':').split(input);
+
+        // filter out entries where the value matches the pattern "${.*}"
+        return attributes.entrySet().stream()
+            .filter(entry -> !entry.getValue().matches("\\$\\{.*\\}"))
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
 }

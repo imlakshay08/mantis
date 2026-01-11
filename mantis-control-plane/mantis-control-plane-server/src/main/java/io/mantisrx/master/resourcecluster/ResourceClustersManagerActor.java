@@ -21,21 +21,24 @@ import akka.actor.ActorRef;
 import akka.actor.Props;
 import akka.actor.SupervisorStrategy;
 import akka.japi.pf.ReceiveBuilder;
-import io.mantisrx.master.akka.MantisActorSupervisorStrategy;
+import io.mantisrx.common.akka.MantisActorSupervisorStrategy;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.AddNewJobArtifactsToCacheRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetActiveJobsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetAssignedTaskExecutorRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetAvailableTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetBusyTaskExecutorsRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetDisabledTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetJobArtifactsToCacheRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetRegisteredTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetTaskExecutorStatusRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetUnregisteredTaskExecutorsRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterActor.MarkExecutorTaskCancelledRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.RemoveJobArtifactsToCacheRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.ResourceOverviewRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorBatchAssignmentRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorGatewayRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorInfoRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterScalerActor.QueueClusterRuleRefreshRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterScalerActor.TriggerClusterRuleRefreshRequest;
 import io.mantisrx.master.resourcecluster.proto.SetResourceClusterScalerStatusRequest;
 import io.mantisrx.server.master.config.MasterConfiguration;
@@ -121,11 +124,13 @@ class ResourceClustersManagerActor extends AbstractActor {
 
                 .match(GetRegisteredTaskExecutorsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetBusyTaskExecutorsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
+                .match(GetDisabledTaskExecutorsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetAvailableTaskExecutorsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetUnregisteredTaskExecutorsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetTaskExecutorStatusRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetActiveJobsRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
                 .match(GetAssignedTaskExecutorRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
+                .match(MarkExecutorTaskCancelledRequest.class, req -> getRCActor(req.getClusterID()).forward(req, context()))
 
                 .match(TaskExecutorRegistration.class, registration ->
                     getRCActor(registration.getClusterID()).forward(registration, context()))
@@ -153,6 +158,8 @@ class ResourceClustersManagerActor extends AbstractActor {
                     getRCActor(req.getClusterID()).forward(req, context()))
                 .match(TriggerClusterRuleRefreshRequest.class, req ->
                     getRCScalerActor(req.getClusterID()).forward(req, context()))
+                .match(QueueClusterRuleRefreshRequest.class, req ->
+                    getRCScalerActor(req.getClusterID()).forward(req, context()))
                 .match(SetResourceClusterScalerStatusRequest.class, req ->
                     getRCScalerActor(req.getClusterID()).forward(req, context()))
                 .build();
@@ -167,13 +174,17 @@ class ResourceClustersManagerActor extends AbstractActor {
                     Duration.ofMillis(masterConfiguration.getHeartbeatIntervalInMs()),
                     Duration.ofMillis(masterConfiguration.getAssignmentIntervalInMs()),
                     Duration.ofMillis(masterConfiguration.getAssignmentIntervalInMs()),
+                    Duration.ofMillis(masterConfiguration.getSchedulerLeaseExpirationDurationInMs()),
                     clock,
                     rpcService,
                     mantisJobStore,
                     jobMessageRouter,
                     masterConfiguration.getMaxJobArtifactsToCache(),
                     masterConfiguration.getJobClustersWithArtifactCachingEnabled(),
-                    masterConfiguration.isJobArtifactCachingEnabled()),
+                    masterConfiguration.isJobArtifactCachingEnabled(),
+                    masterConfiguration.getSchedulingConstraints(),
+                    masterConfiguration.getFitnessCalculator(),
+                    masterConfiguration.getAvailableTaskExecutorMutatorHook()),
                 "ResourceClusterActor-" + clusterID.getResourceID());
         log.info("Created resource cluster actor for {}", clusterID);
         return clusterActor;

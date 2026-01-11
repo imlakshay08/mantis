@@ -16,14 +16,19 @@
 
 package io.reactivex.mantis.network.push;
 
+import java.lang.reflect.Constructor;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import rx.functions.Func1;
 
 
-public class Routers {
+public class Routers implements RouterFactory {
+    private static final Logger logger = LoggerFactory.getLogger(Routers.class);
 
-    private Routers() {}
+    public Routers() {}
 
 
     public static <K, V> Router<KeyValuePair<K, V>> consistentHashingLegacyTcpProtocol(String name,
@@ -45,7 +50,7 @@ public class Routers {
                                 .put(valueBytes) // value bytes
                                 .array();
             }
-        }, HashFunctions.ketama());
+        }, HashFunctions.xxh3());
     }
 
     private static byte[] dataPayload(byte[] data) {
@@ -113,5 +118,10 @@ public class Routers {
 
     public static Func1<String, byte[]> string() {
         return stringUtf8();
+    }
+
+    @Override
+    public <T> Router<T> scalarStageToStageRouter(String name, Func1<T, byte[]> toBytes) {
+        return roundRobinLegacyTcpProtocol(name, toBytes);
     }
 }

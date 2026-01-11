@@ -25,16 +25,23 @@ import io.mantisrx.master.resourcecluster.proto.GetClusterIdleInstancesRequest;
 import io.mantisrx.master.resourcecluster.proto.GetClusterUsageResponse;
 import io.mantisrx.master.resourcecluster.proto.GetClusterUsageResponse.GetClusterUsageResponseBuilder;
 import io.mantisrx.master.resourcecluster.proto.GetClusterUsageResponse.UsageByGroupKey;
+import io.mantisrx.master.scheduler.CpuWeightedFitnessCalculator;
+import io.mantisrx.master.scheduler.FitnessCalculator;
 import io.mantisrx.runtime.MachineDefinition;
 import io.mantisrx.server.core.domain.WorkerId;
+import io.mantisrx.server.core.scheduler.SchedulingConstraints;
 import io.mantisrx.server.master.resourcecluster.ContainerSkuID;
 import io.mantisrx.server.master.resourcecluster.ResourceCluster.ResourceOverview;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorAllocationRequest;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorID;
 import io.mantisrx.server.master.resourcecluster.TaskExecutorRegistration;
+import io.mantisrx.server.master.resourcecluster.TaskExecutorRegistration.TaskExecutorGroupKey;
 import io.mantisrx.shaded.com.google.common.cache.Cache;
 import io.mantisrx.shaded.com.google.common.cache.CacheBuilder;
 import io.mantisrx.shaded.com.google.common.cache.RemovalListener;
+
+import java.time.Duration;
+import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -45,21 +52,21 @@ import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.SortedMap;
 import java.util.TreeSet;
-import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 import lombok.Builder;
-import lombok.RequiredArgsConstructor;
+import lombok.Getter;
 import lombok.ToString;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.math3.util.Precision;
 
 @Slf4j
-class ExecutorStateManagerImpl implements ExecutorStateManager {
+public class ExecutorStateManagerImpl implements ExecutorStateManager {
     private final Map<TaskExecutorID, TaskExecutorState> taskExecutorStateMap = new HashMap<>();
     Cache<String, JobRequirements> pendingJobRequests = CacheBuilder.newBuilder()
         .maximumSize(1000)
@@ -69,28 +76,84 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         })
         .build();
 
-    @RequiredArgsConstructor
+    @Getter
     @ToString
-    static class JobRequirements {
-        public final Map<Double, Integer> coresToWorkerCount;
+    class JobRequirements {
+        private final Map<TaskExecutorGroupKey, Integer> groupToTaskExecutorCount;
+
+        JobRequirements(Map<SchedulingConstraints, List<TaskExecutorAllocationRequest>> constraintsToTaskAllocationRequests) {
+            this.groupToTaskExecutorCount = constraintsToTaskAllocationRequests
+                .entrySet()
+                .stream()
+                .collect(Collectors.toMap(
+                    entry -> findBestFitGroupOrDefault(entry.getKey()),
+                    entry -> entry.getValue().size(),
+                    Integer::sum
+                ));
+        }
 
         public int getTotalWorkers() {
-            return coresToWorkerCount.values().stream().mapToInt(Integer::intValue).sum();
+            return groupToTaskExecutorCount.values().stream().mapToInt(Integer::intValue).sum();
+        }
+
+        private TaskExecutorGroupKey findBestFitGroupOrDefault(SchedulingConstraints constraints) {
+            Optional<TaskExecutorGroupKey> bestGroup = findBestGroup(constraints);
+            if (!bestGroup.isPresent()) {
+                log.warn("No fitting group found for provided constraints {}", constraints);
+            }
+            return bestGroup.orElse(new TaskExecutorGroupKey(constraints.getMachineDefinition(), constraints.getSizeName(), constraints.getSchedulingAttributes()));
         }
     }
 
     /**
-     * Cache the available executors ready to accept assignments. Note these executors' state are not strongly
-     * synchronized and requires state level check when matching.
+     * Cache the available executors ready to accept assignments.
      */
-    private final SortedMap<Double, NavigableSet<TaskExecutorHolder>> executorByCores = new ConcurrentSkipListMap<>();
+    private final Map<TaskExecutorGroupKey, NavigableSet<TaskExecutorHolder>> executorsByGroup = new HashMap<>();
+
+    private final FitnessCalculator fitnessCalculator;
+
+    private final Map<String, String> schedulingAttributes;
+
+    private final Duration schedulerLeaseExpirationDuration;
 
     private final Cache<TaskExecutorID, TaskExecutorState> archivedState = CacheBuilder.newBuilder()
         .maximumSize(10000)
         .expireAfterWrite(24, TimeUnit.HOURS)
-        .removalListener(notification ->
-            log.info("Archived TaskExecutor: {} removed due to: {}", notification.getKey(), notification.getCause()))
+        .removalListener(notification -> {
+            TaskExecutorState state = (TaskExecutorState) notification.getValue();
+            boolean teIsDisabled = state != null && state.onNodeDisabled();
+            log.info("Archived TaskExecutor: {} with disabled state: {} removed due to: {}", notification.getKey(), teIsDisabled, notification.getCause());
+        })
         .build();
+
+    private final AvailableTaskExecutorMutatorHook availableTaskExecutorMutatorHook;
+
+    ExecutorStateManagerImpl(Map<String, String> schedulingAttributes) {
+        this.schedulingAttributes = schedulingAttributes;
+        this.fitnessCalculator = new CpuWeightedFitnessCalculator();
+        this.schedulerLeaseExpirationDuration = Duration.ofMillis(100);
+        this.availableTaskExecutorMutatorHook = null;
+    }
+
+    ExecutorStateManagerImpl(
+        Map<String, String> schedulingAttributes,
+        FitnessCalculator fitnessCalculator,
+        Duration schedulerLeaseExpirationDuration) {
+        this.schedulingAttributes = schedulingAttributes;
+        this.fitnessCalculator = fitnessCalculator;
+        this.schedulerLeaseExpirationDuration = schedulerLeaseExpirationDuration;
+        this.availableTaskExecutorMutatorHook = null;
+    }
+
+    ExecutorStateManagerImpl(Map<String, String> schedulingAttributes,
+                             FitnessCalculator fitnessCalculator,
+                             Duration schedulerLeaseExpirationDuration,
+                             AvailableTaskExecutorMutatorHook availableTaskExecutorMutatorHook) {
+        this.schedulingAttributes = schedulingAttributes;
+        this.fitnessCalculator = fitnessCalculator;
+        this.schedulerLeaseExpirationDuration = schedulerLeaseExpirationDuration;
+        this.availableTaskExecutorMutatorHook = availableTaskExecutorMutatorHook;
+    }
 
     @Override
     public void trackIfAbsent(TaskExecutorID taskExecutorID, TaskExecutorState state) {
@@ -114,16 +177,16 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         if (state.isAvailable() && state.getRegistration() != null) {
             TaskExecutorHolder teHolder = TaskExecutorHolder.of(taskExecutorID, state.getRegistration());
             log.debug("Marking executor {} as available for matching.", teHolder);
-            double cpuCores = state.getRegistration().getMachineDefinition().getCpuCores();
-            if (!this.executorByCores.containsKey(cpuCores)) {
-                log.info("[executorByCores] adding {} from TE: {}", cpuCores, teHolder);
-                this.executorByCores.putIfAbsent(
-                    cpuCores,
+            TaskExecutorGroupKey taskExecutorGroupKey = state.getRegistration().getGroup();
+            if (!this.executorsByGroup.containsKey(taskExecutorGroupKey)) {
+                log.info("[executorsByGroup] adding {} from TE: {}", taskExecutorGroupKey, teHolder);
+                this.executorsByGroup.putIfAbsent(
+                    taskExecutorGroupKey,
                     new TreeSet<>(TaskExecutorHolder.generationFirstComparator));
             }
 
             log.info("Assign {} to available.", teHolder.getId());
-            return this.executorByCores.get(cpuCores).add(teHolder);
+            return this.executorsByGroup.get(taskExecutorGroupKey).add(teHolder);
         }
         else {
             log.debug("Ignore unavailable TE: {}", taskExecutorID);
@@ -147,9 +210,9 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         if (this.taskExecutorStateMap.containsKey(taskExecutorID)) {
             TaskExecutorState taskExecutorState = this.taskExecutorStateMap.get(taskExecutorID);
             if (taskExecutorState.getRegistration() != null) {
-                double cpuCores = taskExecutorState.getRegistration().getMachineDefinition().getCpuCores();
-                if (this.executorByCores.containsKey(cpuCores)) {
-                    this.executorByCores.get(cpuCores)
+                TaskExecutorGroupKey taskExecutorGroupKey = taskExecutorState.getRegistration().getGroup();
+                if (this.executorsByGroup.containsKey(taskExecutorGroupKey)) {
+                    this.executorsByGroup.get(taskExecutorGroupKey)
                         .remove(TaskExecutorHolder.of(taskExecutorID, taskExecutorState.getRegistration()));
                 }
                 return true;
@@ -263,13 +326,12 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         final BestFit bestFit = new BestFit();
         final boolean isJobIdAlreadyPending = pendingJobRequests.getIfPresent(request.getJobId()) != null;
 
-        for (Entry<MachineDefinition, List<TaskExecutorAllocationRequest>> entry : request.getGroupedByMachineDef().entrySet()) {
-            final MachineDefinition machineDefinition = entry.getKey();
+        for (Entry<SchedulingConstraints, List<TaskExecutorAllocationRequest>> entry : request.getGroupedBySchedulingConstraints().entrySet()) {
+            final SchedulingConstraints schedulingConstraints = entry.getKey();
             final List<TaskExecutorAllocationRequest> allocationRequests = entry.getValue();
+            Optional<Map<TaskExecutorID, TaskExecutorState>> taskExecutors = findTaskExecutorsFor(request, schedulingConstraints, allocationRequests, isJobIdAlreadyPending, bestFit);
 
-            Optional<Map<TaskExecutorID, TaskExecutorState>> taskExecutors = findTaskExecutorsFor(request, machineDefinition, allocationRequests, isJobIdAlreadyPending, bestFit);
-
-            // Mark noResourcesAvailable if we can't find enough TEs for a given machine def
+            // Mark noResourcesAvailable if we can't find enough TEs for a given set of scheduling constraints
             if (!taskExecutors.isPresent()) {
                 noResourcesAvailable = true;
                 break;
@@ -284,63 +346,104 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         }
 
         if (noResourcesAvailable) {
-            log.warn("Not all machine def had enough workers available to fulfill the request {}", request);
+            log.warn("Not all scheduling constraints had enough workers available to fulfill the request {}", request);
             return Optional.empty();
         } else {
-            // Return best fit only if there are enough available TEs for all machine def
+            // Return best fit only if there are enough available TEs for all scheduling constraints
             return Optional.of(bestFit);
         }
 
     }
 
-    private Optional<Map<TaskExecutorID, TaskExecutorState>> findBestFitFor(TaskExecutorBatchAssignmentRequest request, MachineDefinition machineDefinition, Integer numWorkers, BestFit currentBestFit) {
+    private Optional<Map<TaskExecutorID, TaskExecutorState>> findBestFitFor(TaskExecutorBatchAssignmentRequest request, SchedulingConstraints schedulingConstraints, Integer numWorkers, BestFit currentBestFit) {
         // only allow allocation in the lowest CPU cores matching group.
-        SortedMap<Double, NavigableSet<TaskExecutorHolder>> targetMap =
-            this.executorByCores.tailMap(machineDefinition.getCpuCores());
+        Optional<TaskExecutorGroupKey> bestFitTeGroupKey = findBestGroup(schedulingConstraints);
 
-        if (targetMap.isEmpty()) {
-            log.warn("Cannot find any executor for request: {}", request);
+        if (!bestFitTeGroupKey.isPresent()) {
+            log.warn("Cannot find any matching sku for request: {}", request);
             return Optional.empty();
         }
-        Double targetCoreCount = targetMap.firstKey();
-        log.debug("Applying assignmentReq: {} to {} cores.", request, targetCoreCount);
 
-        Double requestedCoreCount = machineDefinition.getCpuCores();
-        if (Math.abs(targetCoreCount - requestedCoreCount) > 1E-10) {
-            // this mismatch should not happen in production and indicates TE registration/spec problem.
-            log.warn("Requested core count mismatched. requested: {}, found: {} for {}", requestedCoreCount,
-                targetCoreCount,
-                request);
-        }
-
-        if (this.executorByCores.get(targetCoreCount).isEmpty()) {
-            log.warn("No available TE found for core count: {}, request: {}", targetCoreCount, request);
+        log.info("Applying assignment request: {} to best fit TE group {}.", request, bestFitTeGroupKey);
+        if (!this.executorsByGroup.containsKey(bestFitTeGroupKey.get())) {
+            log.warn("No available TE found for best fit TE group: {}, request: {}", bestFitTeGroupKey.get(), request);
             return Optional.empty();
         }
+
+        Stream<TaskExecutorHolder> availableTEs = this.executorsByGroup.get(bestFitTeGroupKey.get())
+            .descendingSet()
+            .stream()
+            .filter(teHolder -> {
+                if (!this.taskExecutorStateMap.containsKey(teHolder.getId())) {
+                    return false;
+                }
+                if (currentBestFit.contains(teHolder.getId())) {
+                    return false;
+                }
+                TaskExecutorState st = this.taskExecutorStateMap.get(teHolder.getId());
+                return st.isAvailable() &&
+                    // when a TE is returned from here to be used for scheduling, its state remain active until
+                    // the scheduler trigger another message to update (lock) the state. However when large number
+                    // of the requests are active at the same time on same sku, the gap between here and the message
+                    // to lock the state can be large so another schedule request message can be in between and
+                    // got the same set of TEs. To avoid this, a lease is added to each TE state to temporarily
+                    // lock the TE to be used again. Since this is only lock between actor messages and lease
+                    // duration can be short.
+                    st.getLastSchedulerLeasedDuration().compareTo(this.schedulerLeaseExpirationDuration) > 0 &&
+                    st.getRegistration() != null;
+            });
+
+        if(availableTaskExecutorMutatorHook != null) {
+            availableTEs = availableTaskExecutorMutatorHook.mutate(availableTEs, request, schedulingConstraints);
+        }
+
 
         return Optional.of(
-            this.executorByCores.get(targetCoreCount)
-                .descendingSet()
-                .stream()
-                .filter(teHolder -> {
-                    if (!this.taskExecutorStateMap.containsKey(teHolder.getId())) {
-                        return false;
-                    }
-
-                    if (currentBestFit.contains(teHolder.getId())) {
-                        return false;
-                    }
-
-                    TaskExecutorState st = this.taskExecutorStateMap.get(teHolder.getId());
-                    return st.isAvailable() &&
-                        st.getRegistration() != null &&
-                        st.getRegistration().getMachineDefinition().canFit(machineDefinition);
-                })
+                availableTEs
                 .limit(numWorkers)
-                .map(TaskExecutorHolder::getId)
+                .map(teHolder -> {
+                    TaskExecutorState st = this.taskExecutorStateMap.get(teHolder.getId());
+                    st.updateLastSchedulerLeased();
+                    return teHolder.getId();
+                })
                 .collect(Collectors.toMap(
                     taskExecutorID -> taskExecutorID,
                     this.taskExecutorStateMap::get)));
+    }
+
+    /**
+     * Verifies if all scheduling attributes constraints are satisfied.
+     *
+     * For each entry in 'schedulingAttributes':
+     * - Fetch the corresponding attribute value from Task Executor scheduling attributes, if not present, default to the value from the current entry.
+     * - Fetch the corresponding attribute value from Schedule Request scheduling attributes, if not present, default to the value from the current entry.
+     * - Checks if these two values are equal ignoring case. If any pair is not equal, the function returns false.
+     *
+     * Hence, the function ensures that the TaskExecutor scheduling attributes match or satisfy the constraints required. If either the TaskExecutor registration or the scheduling request lacks an attribute, it uses the provided defaults.
+     *
+     * @param constraints The schedule request constraints to be satisfied.
+     * @param teAssignmentAttributes The scheduling attributes of a Task Executor that needs to satisfy scheduling constraints.
+     *
+     * @return true if all allocation constraints are satisfied, false otherwise.
+     */
+    public boolean areSchedulingAttributeConstraintsSatisfied(SchedulingConstraints constraints, Map<String, String> teAssignmentAttributes) {
+        Map<String, String> teAssignmentAttributesLowercased = teAssignmentAttributes.entrySet()
+            .stream()
+            .collect(Collectors.toMap(entry -> entry.getKey().toLowerCase(), Map.Entry::getValue));
+
+        Map<String, String> constraintsAttributesLowercased = constraints.getSchedulingAttributes().entrySet()
+            .stream()
+            .collect(Collectors.toMap(entry -> entry.getKey().toLowerCase(), Map.Entry::getValue));
+
+        return schedulingAttributes.entrySet()
+            .stream()
+            .allMatch(entry -> {
+                String lowerCaseKey = entry.getKey().toLowerCase();
+                return teAssignmentAttributesLowercased
+                    .getOrDefault(lowerCaseKey, entry.getValue())
+                    .equalsIgnoreCase(constraintsAttributesLowercased
+                        .getOrDefault(lowerCaseKey, entry.getValue()));
+            });
     }
 
     @Override
@@ -363,11 +466,6 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
                 return;
             }
 
-            // do not count the disabled TEs.
-            if (value.isDisabled()) {
-                return;
-            }
-
             Optional<String> groupKeyO =
                 req.getGroupKeyFunc().apply(value.getRegistration());
 
@@ -379,7 +477,7 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
             String groupKey = groupKeyO.get();
 
             Pair<Integer, Integer> kvState = Pair.of(
-                value.isAvailable() ? 1 : 0,
+                value.isAvailable() && !value.isDisabled() ? 1 : 0,
                 value.isRegistered() ? 1 : 0);
 
             if (usageByGroupKey.containsKey(groupKey)) {
@@ -403,7 +501,7 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
             if (!pendingCountByGroupKey.containsKey(groupKey)) {
                 pendingCountByGroupKey.put(
                     groupKey,
-                    getPendingCountyByCores(value.getRegistration().getMachineDefinition().getCpuCores()));
+                    getPendingCountByTaskExecutorGroup(value.getRegistration().getGroup()));
             }
         });
 
@@ -428,38 +526,164 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
         return res;
     }
 
-    private int getPendingCountyByCores(Double cores) {
+    /**
+     * Calculates the total count of pending scheduling requests for a specific Task Executor group.
+     * The function does this by summing over the job requests' group-to-task executor counts.
+     *
+     * @param teGroup the key of the task executor group for which to calculate the pending request count.
+     * @return The total count of pending requests for the provided task executor group.
+     */
+    private int getPendingCountByTaskExecutorGroup(TaskExecutorGroupKey teGroup) {
         return pendingJobRequests
             .asMap()
             .values()
             .stream()
-            .map(req -> req.coresToWorkerCount.getOrDefault(cores, 0))
+            .map(req -> req.getGroupToTaskExecutorCount().getOrDefault(teGroup, 0))
             .reduce(Integer::sum)
             .orElse(0);
     }
 
-    private Optional<Map<TaskExecutorID, TaskExecutorState>> findTaskExecutorsFor(TaskExecutorBatchAssignmentRequest request, MachineDefinition machineDefinition, List<TaskExecutorAllocationRequest> allocationRequests, boolean isJobIdAlreadyPending, BestFit currentBestFit) {
-        // Finds best fit for N workers of the same machine def
+    private Optional<Map<TaskExecutorID, TaskExecutorState>> findTaskExecutorsFor(TaskExecutorBatchAssignmentRequest request, SchedulingConstraints schedulingConstraints, List<TaskExecutorAllocationRequest> allocationRequests, boolean isJobIdAlreadyPending, BestFit currentBestFit) {
+        // Finds best fit for N workers of the same scheduling constraints
         final Optional<Map<TaskExecutorID, TaskExecutorState>> taskExecutors = findBestFitFor(
-            request, machineDefinition, allocationRequests.size(), currentBestFit);
+            request, schedulingConstraints, allocationRequests.size(), currentBestFit);
 
         // Verify that the number of task executors returned matches the asked
         if (taskExecutors.isPresent() && taskExecutors.get().size() == allocationRequests.size()) {
             return taskExecutors;
         } else {
-            log.warn("Not enough available TEs found for machine def {} with core count: {}, request: {}",
-                machineDefinition, machineDefinition.getCpuCores(), request);
+            log.warn("Not enough available TEs found for scheduling constraints {}, request: {}", schedulingConstraints, request);
+            if (taskExecutors.isPresent()) {
+                log.debug("Found {} Task Executors: {} for request: {} with constraints: {}",
+                    taskExecutors.get().size(), taskExecutors.get(), request, schedulingConstraints);
+            } else {
+                log.warn("No suitable Task Executors found for request: {} with constraints: {}",
+                    request, schedulingConstraints);
+            }
 
             // If there are not enough workers with the given spec then add the request the pending ones
             if (!isJobIdAlreadyPending && request.getAllocationRequests().size() > 2) {
                 // Add jobId to pending requests only once
                 if (pendingJobRequests.getIfPresent(request.getJobId()) == null) {
-                    log.info("Adding job {} to pending requests for {} machine {}", request.getJobId(), allocationRequests.size(), machineDefinition);
-                    pendingJobRequests.put(request.getJobId(), new JobRequirements(request.getGroupedByCoresCount()));
+                    log.info("Adding job {} to pending requests for {} scheduling constraints {}", request.getJobId(), allocationRequests.size(), schedulingConstraints);
+                    pendingJobRequests.put(request.getJobId(), new JobRequirements(request.getGroupedBySchedulingConstraints()));
                 }
             }
             return Optional.empty();
         }
+    }
+
+    /**
+     * Finds the best fit Task Executor Group Key based on requested constraints.
+     *
+     * First, it tries to find a best fit group by matching sizeNames. If it fails,
+     * it then uses a fitness calculator to get the best fit.
+     *
+     * @param requestedConstraints The constraints for the scheduling request.
+     * @return An Optional of the best fit Task Executor Group Key. If no suitable key is found,
+     *         it returns an empty Optional.
+     */
+    private Optional<TaskExecutorGroupKey> findBestGroup(SchedulingConstraints requestedConstraints) {
+        Optional<TaskExecutorGroupKey> bestGroupBySizeName = findBestGroupBySizeNameMatch(requestedConstraints);
+
+        return bestGroupBySizeName.isPresent()
+            ? bestGroupBySizeName
+            : findBestGroupByFitnessCalculator(requestedConstraints);
+    }
+
+    /**
+     * Finds the best fit Task Executor Group by matching sizeNames.
+     *
+     * @param requestedConstraints The constraints for the scheduling request.
+     * @return An Optional of the best fit Task Executor Group Key based on sizeName and scheduling attributes matching.
+     *         If no suitable key is found, it returns an empty Optional.
+     */
+    private Optional<TaskExecutorGroupKey> findBestGroupBySizeNameMatch(SchedulingConstraints requestedConstraints) {
+        return executorsByGroup.keySet()
+            .stream()
+            // Filter to retain groups where sizeName is present
+            .filter(group -> group.getSizeName().isPresent())
+            // Filter to retain groups where the requested sizeName is also present
+            .filter(group -> requestedConstraints.getSizeName().isPresent())
+            // Filter to retain groups where sizeNames of group and requested constraints are equal
+            .filter(group -> group.getSizeName().get().equalsIgnoreCase(requestedConstraints.getSizeName().get()))
+            // Verify scheduling attribute constraints
+            .filter(taskExecutorGroupKey -> areSchedulingAttributeConstraintsSatisfied(requestedConstraints,
+                taskExecutorGroupKey.getSchedulingAttributes()))
+            // Get highest generation group
+            .max(Comparator.comparing(taskExecutorGroupKey -> {
+                NavigableSet<TaskExecutorHolder> holders = executorsByGroup.get(taskExecutorGroupKey);
+                if (holders.isEmpty()) {
+                    return null;
+                } else {
+                    return holders.last().getGeneration();
+                }
+            }, Comparator.nullsLast(Comparator.reverseOrder())));
+    }
+
+    /**
+     * Finds the best fit Task Executor Group by using a fitness calculator on machine definitions.
+     *
+     * Groups that match requestedConstraints and have a fitness score greater than 0 are considered.
+     * Among these, the key with the highest score is returned.
+     *
+     * @param requestedConstraints The constraints for the scheduling request.
+     * @return An Optional of the best fit Task Executor Group Key according to a fitness calculator.
+     *         If no suitable key is found, it returns an empty Optional.
+     */
+    private Optional<TaskExecutorGroupKey> findBestGroupByFitnessCalculator(SchedulingConstraints requestedConstraints) {
+        log.info("Falling back to find best group by fitness calculator for constraints: {}", requestedConstraints);
+        log.debug("All present executor groups: {}", executorsByGroup.keySet());
+
+        // Filter and sort Task Executor Group Keys based on fitness score
+        final List<Map.Entry<TaskExecutorGroupKey, Double>> groupFitnessList = executorsByGroup.keySet()
+            .stream()
+            // Filter out if both sizeName exist and are different (ie. small vs large)
+            .filter(taskExecutorGroupKey -> {
+                Optional<String> teGroupSizeName = taskExecutorGroupKey.getSizeName();
+                Optional<String> requestSizeName = requestedConstraints.getSizeName();
+
+                return !(teGroupSizeName.isPresent() && requestSizeName.isPresent()
+                    && !teGroupSizeName.get().equalsIgnoreCase(requestSizeName.get()));
+            })
+            // Verify scheduling attribute constraints
+            .filter(taskExecutorGroupKey -> areSchedulingAttributeConstraintsSatisfied(requestedConstraints,
+                taskExecutorGroupKey.getSchedulingAttributes()))
+            // Calculate fitness score for each Task Executor Group
+            .map(key -> new AbstractMap.SimpleEntry<>(
+                key,
+                fitnessCalculator.calculate(requestedConstraints.getMachineDefinition(), key.getMachineDefinition())
+            ))
+            // Filter out entries with non-positive fitness scores (aka. requested machine doesn't fit in TE)
+            .filter(entry -> entry.getValue() > 0)
+            // During the process of adding size metadata to an existing SKU and initiating corresponding ASG updates,
+            // TEs from both new and existing ASGs are now grouped separately in the resource cluster actor, i.e.,
+            // one with size and one without. Due to this, issues may arise during task migrations as it's not
+            // predictable which TEs will be chosen by the scheduler. While, instead, we want to always use TEs from the latest ASGs.
+            .sorted((entry1, entry2) -> {
+                int fitnessComparison = Precision.compareTo(entry2.getValue(), entry1.getValue(), 0.0001);
+                if (fitnessComparison != 0) {
+                    return fitnessComparison;
+                } else {
+                    NavigableSet<TaskExecutorHolder> holders1 = executorsByGroup.get(entry1.getKey());
+                    NavigableSet<TaskExecutorHolder> holders2 = executorsByGroup.get(entry2.getKey());
+                    String generation1 = holders1.isEmpty() ? null : holders1.last().getGeneration();
+                    String generation2 = holders2.isEmpty() ? null : holders2.last().getGeneration();
+                    return Comparator.<String>nullsLast(Comparator.reverseOrder()).compare(generation1, generation2);
+                }
+            })
+            .collect(Collectors.toList());
+
+        if (groupFitnessList.isEmpty()) {
+            log.debug("No suitable Task Executor Groups found for constraints: {}", requestedConstraints);
+        } else {
+            log.debug("Fitness calculation results for the Task Executor Groups:");
+            for (Map.Entry<TaskExecutorGroupKey, Double> entry : groupFitnessList) {
+                log.debug("TaskExecutorGroupKey: {}, Fitness Score: {}", entry.getKey(), entry.getValue());
+            }
+        }
+
+        return groupFitnessList.stream().map(Map.Entry::getKey).findFirst();
     }
 
     /**
@@ -468,7 +692,7 @@ class ExecutorStateManagerImpl implements ExecutorStateManager {
      */
     @Builder
     @Value
-    protected static class TaskExecutorHolder {
+    public static class TaskExecutorHolder {
         TaskExecutorID Id;
         String generation;
 

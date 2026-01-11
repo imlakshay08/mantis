@@ -81,7 +81,7 @@ public class MantisHttpClientImpl<I, O> extends HttpClientImpl<I, O> {
     }
 
     protected void trackConnection(Channel channel) {
-        log.info("Tracking connection: {}", channel.toString());
+        log.debug("Tracking connection: {}", channel.toString());
         synchronized (connectionTracker) {
             if (isClosed.get()) {
                 log.info("Http client is already closed. Close the channel immediately. {}", channel);
@@ -96,15 +96,28 @@ public class MantisHttpClientImpl<I, O> extends HttpClientImpl<I, O> {
     protected void closeConn() {
         synchronized (connectionTracker) {
             isClosed.set(true);
-            for (Channel value : this.connectionTracker) {
-                Channel channel = value;
-                log.info("Closing connection: {}. Status at close: isActive: {}, isOpen: {}, isWritable: {}",
-                    channel.toString(), channel.isActive(), channel.isOpen(), channel.isWritable());
-                channel.close();
-                numConnectionsTracked.decrement();
-            }
-            this.connectionTracker.clear();
+            resetConnInternalUnsafe();
         }
+    }
+
+    protected void resetConn() {
+        synchronized (connectionTracker) {
+            resetConnInternalUnsafe();
+        }
+    }
+
+    /**
+     * Not thread safe, must be called with explicit lock.
+     */
+    private void resetConnInternalUnsafe() {
+        for (Channel value : this.connectionTracker) {
+            Channel channel = value;
+            log.info("Closing connection: {}. Status at close: isActive: {}, isOpen: {}, isWritable: {}",
+                channel.toString(), channel.isActive(), channel.isOpen(), channel.isWritable());
+            channel.close();
+            numConnectionsTracked.decrement();
+        }
+        this.connectionTracker.clear();
     }
 
     protected int connectionTrackerSize() {

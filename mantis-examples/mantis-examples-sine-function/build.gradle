@@ -15,8 +15,6 @@
  */
 apply plugin: "mantis"
 
-apply plugin: 'mantis'
-
 configurations.all {
     resolutionStrategy {
         force "com.google.guava:guava:31.1-jre"
@@ -29,6 +27,11 @@ task execute(type:JavaExec) {
     classpath = sourceSets.main.runtimeClasspath
 }
 dependencies {
-    implementation project(':mantis-server:mantis-server-worker')
+    implementation project(':mantis-runtime-executor')
     implementation libraries.spectatorApi
 }
+
+// Add explicit dependency on copyLibs task from mantis-runtime-executor
+// This fixes the build error where compileJava uses output from copyLibs without declaring a dependency
+compileJava.dependsOn(":mantis-runtime-executor:copyLibs")
+delombok.dependsOn(":mantis-runtime-executor:copyLibs")

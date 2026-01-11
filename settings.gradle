@@ -15,23 +15,26 @@
  */
 
 plugins {
-    id 'com.gradle.enterprise' version '3.4.1'
+    id 'com.gradle.enterprise' version '3.18.1'
 }
 
 rootProject.name = 'mantis'
 
 include 'mantis-client'
 include 'mantis-common'
+include 'mantis-common-akka'
+include 'mantis-jm-akka'
 include 'mantis-common-serde'
 
 include 'mantis-connectors:mantis-connector-iceberg'
-include 'mantis-connectors:mantis-connector-job'
+include 'mantis-connectors:mantis-connector-job-source'
 include 'mantis-connectors:mantis-connector-kafka'
 include 'mantis-connectors:mantis-connector-publish'
 
 include 'mantis-control-plane:mantis-control-plane-client'
 include 'mantis-control-plane:mantis-control-plane-core'
 include 'mantis-control-plane:mantis-control-plane-server'
+include 'mantis-control-plane:mantis-control-plane-dynamodb'
 
 include 'mantis-discovery-proto'
 
@@ -55,17 +58,19 @@ include ':mantis-publish:mantis-publish-netty-guice'
 include 'mantis-remote-observable'
 include 'mantis-runtime'
 include 'mantis-runtime-loader'
+include 'mantis-runtime-autoscaler-api'
+include 'mantis-runtime-executor'
+include 'mantis-rxcontrol'
+
+include 'mantis-source-jobs:mantis-source-job-kafka'
+include 'mantis-source-jobs:mantis-source-job-publish'
 
 include 'mantis-server:mantis-server-agent'
-include 'mantis-server:mantis-server-worker'
 include 'mantis-server:mantis-server-worker-client'
 
 include 'mantis-shaded'
 
 include 'mantis-testcontainers'
-
-include 'mantis-source-jobs:mantis-source-job-kafka'
-include 'mantis-source-jobs:mantis-source-job-publish'
 
 gradleEnterprise {
     buildScan {
@@ -74,4 +79,3 @@ gradleEnterprise {
         termsOfServiceAgree = 'yes'
     }
 }
-

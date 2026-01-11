@@ -26,12 +26,14 @@ import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetActiveJobsRequ
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetAssignedTaskExecutorRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetAvailableTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetBusyTaskExecutorsRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetDisabledTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetJobArtifactsToCacheRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetRegisteredTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetTaskExecutorStatusRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetTaskExecutorWorkerMappingRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetUnregisteredTaskExecutorsRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.InitializeTaskExecutorRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterActor.MarkExecutorTaskCancelledRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.RemoveJobArtifactsToCacheRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.ResourceOverviewRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorBatchAssignmentRequest;
@@ -39,7 +41,7 @@ import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorGatew
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorInfoRequest;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorsAllocation;
 import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorsList;
-import io.mantisrx.master.resourcecluster.ResourceClusterScalerActor.TriggerClusterRuleRefreshRequest;
+import io.mantisrx.master.resourcecluster.ResourceClusterScalerActor.QueueClusterRuleRefreshRequest;
 import io.mantisrx.master.resourcecluster.proto.SetResourceClusterScalerStatusRequest;
 import io.mantisrx.server.core.domain.ArtifactID;
 import io.mantisrx.server.core.domain.WorkerId;
@@ -119,6 +121,16 @@ class ResourceClusterAkkaImpl extends ResourceClusterGatewayAkkaImpl implements 
     }
 
     @Override
+    public CompletableFuture<List<TaskExecutorID>> getDisabledTaskExecutors(Map<String, String> attributes) {
+        return Patterns.ask(
+                resourceClusterManagerActor,
+                new GetDisabledTaskExecutorsRequest(clusterID, attributes), askTimeout)
+            .thenApply(TaskExecutorsList.class::cast)
+            .toCompletableFuture()
+            .thenApply(l -> l.getTaskExecutors());
+    }
+
+    @Override
     public CompletableFuture<List<TaskExecutorID>> getUnregisteredTaskExecutors(Map<String, String> attributes) {
         return Patterns.ask(
                 resourceClusterManagerActor,
@@ -143,6 +155,17 @@ class ResourceClusterAkkaImpl extends ResourceClusterGatewayAkkaImpl implements 
             .ask(
                 resourceClusterManagerActor,
                 new AddNewJobArtifactsToCacheRequest(clusterID, artifacts),
+                askTimeout)
+            .thenApply(Ack.class::cast)
+            .toCompletableFuture();
+    }
+
+    @Override
+    public CompletableFuture<Ack> markTaskExecutorWorkerCancelled(WorkerId workerId) {
+        return Patterns
+            .ask(
+                resourceClusterManagerActor,
+                new MarkExecutorTaskCancelledRequest(clusterID, workerId),
                 askTimeout)
             .thenApply(Ack.class::cast)
             .toCompletableFuture();
@@ -242,7 +265,7 @@ class ResourceClusterAkkaImpl extends ResourceClusterGatewayAkkaImpl implements 
         return Patterns
             .ask(
                 resourceClusterManagerActor,
-                TriggerClusterRuleRefreshRequest.builder().clusterID(this.clusterID).build(),
+                QueueClusterRuleRefreshRequest.builder().clusterID(this.clusterID).build(),
                 askTimeout)
             .thenApply(Ack.class::cast)
             .toCompletableFuture();
