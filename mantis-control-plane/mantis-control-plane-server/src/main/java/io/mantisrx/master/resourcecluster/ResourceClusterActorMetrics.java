@@ -24,19 +24,8 @@ import com.netflix.spectator.api.Tag;
 import com.netflix.spectator.api.Timer;
 import io.mantisrx.common.metrics.spectator.MetricId;
 import io.mantisrx.common.metrics.spectator.SpectatorRegistryFactory;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.CacheJobArtifactsOnTaskExecutorRequest;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.GetClusterUsageRequest;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.HeartbeatTimeout;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.InitializeTaskExecutorRequest;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorBatchAssignmentRequest;
-import io.mantisrx.master.resourcecluster.ResourceClusterActor.TaskExecutorGatewayRequest;
-import io.mantisrx.master.resourcecluster.proto.GetClusterIdleInstancesRequest;
-import io.mantisrx.server.master.resourcecluster.TaskExecutorDisconnection;
-import io.mantisrx.server.master.resourcecluster.TaskExecutorHeartbeat;
-import io.mantisrx.server.master.resourcecluster.TaskExecutorRegistration;
-import io.mantisrx.shaded.com.google.common.collect.ImmutableMap;
 import io.vavr.Tuple2;
-import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
 
@@ -55,12 +44,24 @@ class ResourceClusterActorMetrics {
     public static final String HEARTBEAT_TIMEOUT = "taskExecutorHeartbeatTimeout";
 
     public static final String TE_CONNECTION_FAILURE = "taskExecutorConnectionFailure";
+    public static final String TASK_EXECUTOR_ASSIGNMENT_FAILURE = "taskExecutorAssignmentFailure";
 
     public static final String RC_ACTOR_RESTART = "resourceClusterActorRestart";
     public static final String MAX_JOB_ARTIFACTS_TO_CACHE_REACHED = "maxJobArtifactsToCacheReached";
+    public static final String RESERVATION_PROCESSED = "reservationProcessed";
+    public static final String RESERVATION_UPSERTED = "reservationUpserted";
+    public static final String RESERVATION_INFLIGHT_TIMEOUT = "reservationInFlightTimeout";
+    public static final String RESERVATION_PROCESSING_SKIPPED = "reservationProcessingSkipped";
+    public static final String NUM_PENDING_RESERVATIONS = "numPendingReservations";
+    public static final String RESERVATION_FULFILLMENT_LATENCY = "reservationFulfillmentLatency";
+    public static final String RESERVATION_HEAD_OF_QUEUE_LATENCY = "reservationHeadOfQueueLatency";
+
+    public static final String EXECUTOR_STATE_MANAGER_INIT_FAILURE = "executorStateManagerInitFailure";
+    public static final String CHILD_ACTOR_TERMINATED = "childActorTerminated";
+    public static final String CHILD_ACTOR_RECREATED = "childActorRecreated";
 
     private final Registry registry;
-    private final Map<Class<?>, Tuple2<Counter, Timer>> messageMetrics;
+    private final ConcurrentHashMap<String, Tuple2<Counter, Timer>> messageMetrics;
     private final Tuple2<Counter, Timer> unknownMessageMetrics;
 
     private Id getMessageReceivedId(String messageName) {
@@ -81,19 +82,7 @@ class ResourceClusterActorMetrics {
 
     public ResourceClusterActorMetrics() {
         this.registry = SpectatorRegistryFactory.getRegistry();
-        this.messageMetrics = ImmutableMap.of(
-            TaskExecutorRegistration.class, getBoth("TaskExecutorRegistration"),
-            InitializeTaskExecutorRequest.class, getBoth("InitializeTaskExecutorRequest"),
-            TaskExecutorHeartbeat.class, getBoth("TaskExecutorHeartbeat"),
-            TaskExecutorDisconnection.class, getBoth("TaskExecutorDisconnection"),
-            HeartbeatTimeout.class, getBoth("HeartbeatTimeout"),
-            TaskExecutorBatchAssignmentRequest.class, getBoth("TaskExecutorBatchAssignmentRequest"),
-            TaskExecutorGatewayRequest.class, getBoth("TaskExecutorGatewayRequest"),
-            CacheJobArtifactsOnTaskExecutorRequest.class,
-            getBoth("CacheJobArtifactsOnTaskExecutorRequest"),
-            GetClusterUsageRequest.class, getBoth("GetClusterUsageRequest"),
-            GetClusterIdleInstancesRequest.class, getBoth("GetClusterIdleInstancesRequest")
-        );
+        this.messageMetrics = new ConcurrentHashMap<>();
         this.unknownMessageMetrics = getBoth("UnknownMessage");
     }
 
@@ -107,14 +96,19 @@ class ResourceClusterActorMetrics {
             .increment();
     }
 
+    public void recordTimer(final String metric, final long nanos, final Iterable<Tag> tags) {
+        registry.timer(new MetricId(METRIC_GROUP_ID, metric, tags).getSpectatorId(registry))
+            .record(nanos, TimeUnit.NANOSECONDS);
+    }
+
     public <P> FI.UnitApply<P> withTracking(final FI.UnitApply<P> apply) {
         return p -> {
             final long start = System.nanoTime();
             try {
                 apply.apply(p);
             } finally {
-                final Class<?> pClass = p.getClass();
-                messageMetrics.getOrDefault(pClass, unknownMessageMetrics)
+                final String messageName = p.getClass().getSimpleName();
+                messageMetrics.computeIfAbsent(messageName, this::getBoth)
                     .apply((counter, timer) -> {
                         counter.increment();
                         timer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS);

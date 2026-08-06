@@ -225,7 +225,7 @@ public interface MasterConfiguration extends CoreConfiguration {
     int getMaximumResubmissionsPerWorker();
 
     @Config("mantis.worker.resubmission.interval.secs")
-    @Default("5:10:20")
+    @Default("5:10:30:60:120:600")
     String getWorkerResubmitIntervalSecs();
 
     @Config("mantis.worker.expire.resubmit.delay.secs")
@@ -385,6 +385,10 @@ public interface MasterConfiguration extends CoreConfiguration {
     @Config("mantis.scheduler.handlesAllocationRetries")
     @Default("true")
     boolean getSchedulerHandlesAllocationRetries();
+
+    @Config("mantis.scheduling.reservation.enabled")
+    @Default("true")
+    boolean isReservationSchedulingEnabled();
 
     default Duration getHeartbeatInterval() {
         return Duration.ofMillis(getHeartbeatIntervalInMs());

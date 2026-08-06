@@ -27,6 +27,7 @@ import io.mantisrx.common.metrics.Counter;
 import io.mantisrx.common.metrics.Gauge;
 import io.mantisrx.common.metrics.Metrics;
 import io.mantisrx.common.metrics.MetricsRegistry;
+import io.mantisrx.common.metrics.Timer;
 import io.mantisrx.common.metrics.spectator.MetricGroupId;
 import io.mantisrx.master.api.akka.route.Jackson;
 import io.mantisrx.master.events.LifecycleEventPublisher;
@@ -45,6 +46,7 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,10 +65,11 @@ public class JobWorker implements IMantisWorkerEventProcessor {
     private final Counter numWorkerLaunched;
     private final Counter numWorkerTerminated;
     private final Counter numWorkerLaunchFailed;
-    private final Counter numWorkerUnschedulable;
     private final Counter numWorkersDisabledVM;
     private final Counter numHeartBeatsReceived;
     private final Gauge lastWorkerLaunchToStartMillis;
+    private final Timer workerAcceptedToLaunchedMs;
+    private final Timer workerAcceptedToStartedMs;
 
     /**
      * Creates an instance of JobWorker.
@@ -85,20 +88,22 @@ public class JobWorker implements IMantisWorkerEventProcessor {
                 .addCounter("numWorkerLaunched")
                 .addCounter("numWorkerTerminated")
                 .addCounter("numWorkerLaunchFailed")
-                .addCounter("numWorkerUnschedulable")
                 .addCounter("numWorkersDisabledVM")
                 .addCounter("numHeartBeatsReceived")
                 .addGauge("lastWorkerLaunchToStartMillis")
+                .addTimer("workerAcceptedToLaunchedMs")
+                .addTimer("workerAcceptedToStartedMs")
                 .build();
 
         this.metrics = MetricsRegistry.getInstance().registerAndGet(m);
         this.numWorkerLaunched = metrics.getCounter("numWorkerLaunched");
         this.numWorkerTerminated = metrics.getCounter("numWorkerTerminated");
         this.numWorkerLaunchFailed = metrics.getCounter("numWorkerLaunchFailed");
-        this.numWorkerUnschedulable = metrics.getCounter("numWorkerUnschedulable");
         this.numWorkersDisabledVM = metrics.getCounter("numWorkersDisabledVM");
         this.numHeartBeatsReceived = metrics.getCounter("numHeartBeatsReceived");
         this.lastWorkerLaunchToStartMillis = metrics.getGauge("lastWorkerLaunchToStartMillis");
+        this.workerAcceptedToLaunchedMs = metrics.getTimer("workerAcceptedToLaunchedMs");
+        this.workerAcceptedToStartedMs = metrics.getTimer("workerAcceptedToStartedMs");
     }
 
     public IMantisWorkerMetadata getMetadata() {
@@ -176,8 +181,6 @@ public class JobWorker implements IMantisWorkerEventProcessor {
             persistStateRequired = onWorkerLaunched((WorkerLaunched) workerEvent);
         } else if (workerEvent instanceof WorkerLaunchFailed) {
             persistStateRequired = onWorkerLaunchFailed((WorkerLaunchFailed) workerEvent);
-        } else if (workerEvent instanceof WorkerUnscheduleable) {
-            persistStateRequired = onWorkerUnscheduleable((WorkerUnscheduleable) workerEvent);
         } else if (workerEvent instanceof WorkerResourceStatus) {
             persistStateRequired = onWorkerResourceStatus((WorkerResourceStatus) workerEvent);
         } else if (workerEvent instanceof WorkerHeartbeat) {
@@ -198,8 +201,21 @@ public class JobWorker implements IMantisWorkerEventProcessor {
             LOGGER.debug("on WorkerStatus for {}", workerEvent);
         }
         switch (workerEvent.getState()) {
-            case StartInitiated:
             case Started:
+                setState(workerEvent.getState(), workerEvent.getEventTimeMs(), workerEvent.getStatus().getReason());
+                final long acceptedAt = metadata.getAcceptedAt();
+                if (acceptedAt > 0) {
+                    final long fullStartupLatency = workerEvent.getEventTimeMs() - acceptedAt;
+                    if (fullStartupLatency > 0) {
+                        workerAcceptedToStartedMs.record(fullStartupLatency, TimeUnit.MILLISECONDS);
+                    }
+                }
+                eventPublisher.publishStatusEvent(new WorkerStatusEvent(
+                        StatusEvent.StatusEventType.INFO,
+                    "worker status update", metadata.getStageNum(), workerEvent.getWorkerId(),
+                        workerEvent.getState()));
+                return true;
+            case StartInitiated:
             case Completed:
             case Failed:
                 setState(workerEvent.getState(), workerEvent.getEventTimeMs(), workerEvent.getStatus().getReason());
@@ -249,10 +265,7 @@ public class JobWorker implements IMantisWorkerEventProcessor {
      *         our state doesn't match Mesos)
      */
     private boolean onWorkerLaunched(WorkerLaunched workerEvent) throws InvalidWorkerStateChangeException {
-        if (LOGGER.isDebugEnabled()) {
-            LOGGER.debug("Processing for worker {} with id {}", workerEvent, metadata.getWorkerId());
-        }
-
+        LOGGER.info("JobActor: on WorkerLaunched for {} on {}", workerEvent, metadata.getWorkerId());
         setSlave(workerEvent.getHostname());
         addPorts(workerEvent.getPorts());
         setSlaveID(workerEvent.getVmId());
@@ -264,6 +277,14 @@ public class JobWorker implements IMantisWorkerEventProcessor {
             LOGGER.debug("Worker {} state changed to Launched", workerEvent.getWorkerId());
         }
         numWorkerLaunched.increment();
+
+        final long acceptedAt = metadata.getAcceptedAt();
+        if (acceptedAt > 0) {
+            final long schedulingLatency = workerEvent.getEventTimeMs() - acceptedAt;
+            if (schedulingLatency > 0) {
+                workerAcceptedToLaunchedMs.record(schedulingLatency, TimeUnit.MILLISECONDS);
+            }
+        }
 
         try {
             eventPublisher.publishStatusEvent(new WorkerStatusEvent(
@@ -340,6 +361,13 @@ public class JobWorker implements IMantisWorkerEventProcessor {
                 LOGGER.info("Unexpected error when computing startlatency for {} start time {} launch time {}",
                         workerEvent.getWorkerId().getId(), workerEvent.getEventTimeMs(), metadata.getLaunchedAt());
             }
+            final long acceptedAt = metadata.getAcceptedAt();
+            if (acceptedAt > 0) {
+                final long fullStartupLatency = workerEvent.getEventTimeMs() - acceptedAt;
+                if (fullStartupLatency > 0) {
+                    workerAcceptedToStartedMs.record(fullStartupLatency, TimeUnit.MILLISECONDS);
+                }
+            }
             LOGGER.info("Job {} Worker {} started ", metadata.getJobId(), metadata.getWorkerId());
             eventPublisher.publishStatusEvent(new WorkerStatusEvent(
                     StatusEvent.StatusEventType.INFO,
@@ -374,13 +402,6 @@ public class JobWorker implements IMantisWorkerEventProcessor {
                 StatusEvent.StatusEventType.ERROR,
             "worker launch failed, reason: " + workerEvent.getErrorMessage(), workerEvent.getStageNum(),
                 workerEvent.getWorkerId(), WorkerState.Failed));
-        return true;
-    }
-
-    private boolean onWorkerUnscheduleable(WorkerUnscheduleable workerEvent) {
-        // we shouldn't reach here for Worker Unscheduleable events, as Job Actor would update the readyAt time
-        // in the JobActor on receiving this event
-        numWorkerUnschedulable.increment();
         return true;
     }
 

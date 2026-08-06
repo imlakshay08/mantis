@@ -41,7 +41,7 @@ public class MantisJobDefinition {
     private String version;
     private List<Parameter> parameters;
     private JobSla jobSla;
-    private long subscriptionTimeoutSecs = 0L;
+    private long subscriptionTimeoutSecs;
     private SchedulingInfo schedulingInfo;
     private DeploymentStrategy deploymentStrategy;
     private int slaMin = 0;
@@ -59,14 +59,14 @@ public class MantisJobDefinition {
                                @JsonProperty("url") URL jobJarFileLocation,
                                @JsonProperty("version") String version,
                                @JsonProperty("parameters") List<Parameter> parameters,
-                               @JsonProperty("jobSla") JobSla jobSla,
-                               @JsonProperty("subscriptionTimeoutSecs") long subscriptionTimeoutSecs,
+                               @JsonProperty(value = "jobSla", required = false) JobSla jobSla,
+                               @JsonProperty(value = "subscriptionTimeoutSecs", required = false, defaultValue = "0") long subscriptionTimeoutSecs,
                                @JsonProperty("schedulingInfo") SchedulingInfo schedulingInfo,
                                @JsonProperty("slaMin") int slaMin,
                                @JsonProperty("slaMax") int slaMax,
-                               @JsonProperty("cronSpec") String cronSpec,
-                               @JsonProperty("cronPolicy") NamedJobDefinition.CronPolicy cronPolicy,
-                               @JsonProperty("isReadyForJobMaster") boolean isReadyForJobMaster,
+                               @JsonProperty(value = "cronSpec", required = false, defaultValue = "") String cronSpec,
+                               @JsonProperty(value = "cronPolicy", required = false) NamedJobDefinition.CronPolicy cronPolicy,
+                               @Deprecated @JsonProperty(value = "isReadyForJobMaster", required = false, defaultValue = "false") boolean isReadyForJobMaster,
                                @JsonProperty("migrationConfig") WorkerMigrationConfig migrationConfig,
                                @JsonProperty("labels") List<Label> labels,
                                @JsonProperty("deploymentStrategy") DeploymentStrategy deploymentStrategy
@@ -87,8 +87,7 @@ public class MantisJobDefinition {
             this.labels = new LinkedList<>();
         }
         this.jobSla = jobSla;
-        if (subscriptionTimeoutSecs > 0)
-            this.subscriptionTimeoutSecs = subscriptionTimeoutSecs;
+        this.subscriptionTimeoutSecs = subscriptionTimeoutSecs > 0 ? subscriptionTimeoutSecs : 0L;
         this.schedulingInfo = schedulingInfo;
         this.deploymentStrategy = deploymentStrategy;
         this.slaMin = slaMin;
@@ -97,6 +96,117 @@ public class MantisJobDefinition {
         this.cronPolicy = cronPolicy;
         this.isReadyForJobMaster = isReadyForJobMaster;
         this.migrationConfig = Optional.ofNullable(migrationConfig).orElse(WorkerMigrationConfig.DEFAULT);
+    }
+
+    private MantisJobDefinition(Builder builder) {
+        this.name = builder.name;
+        this.user = builder.user;
+        this.jobJarFileLocation = builder.jobJarFileLocation;
+        this.version = builder.version;
+        this.parameters = builder.parameters != null ? builder.parameters : new LinkedList<>();
+        this.labels = builder.labels != null ? builder.labels : new LinkedList<>();
+        this.jobSla = builder.jobSla;
+        this.subscriptionTimeoutSecs = builder.subscriptionTimeoutSecs > 0 ? builder.subscriptionTimeoutSecs : 0L;
+        this.schedulingInfo = builder.schedulingInfo;
+        this.deploymentStrategy = builder.deploymentStrategy;
+        this.slaMin = builder.slaMin;
+        this.slaMax = builder.slaMax;
+        this.cronSpec = builder.cronSpec != null ? builder.cronSpec : "";
+        this.cronPolicy = builder.cronPolicy;
+        this.isReadyForJobMaster = false;
+        this.migrationConfig = Optional.ofNullable(builder.migrationConfig).orElse(WorkerMigrationConfig.DEFAULT);
+    }
+
+    public static Builder builder(String name, String user, SchedulingInfo schedulingInfo) {
+        return new Builder(name, user, schedulingInfo);
+    }
+
+    public static final class Builder {
+        private final String name;
+        private final String user;
+        private final SchedulingInfo schedulingInfo;
+        private URL jobJarFileLocation;
+        private String version;
+        private List<Parameter> parameters;
+        private JobSla jobSla;
+        private long subscriptionTimeoutSecs;
+        private DeploymentStrategy deploymentStrategy;
+        private int slaMin;
+        private int slaMax;
+        private String cronSpec;
+        private NamedJobDefinition.CronPolicy cronPolicy;
+        private WorkerMigrationConfig migrationConfig;
+        private List<Label> labels;
+
+        private Builder(String name, String user, SchedulingInfo schedulingInfo) {
+            this.name = name;
+            this.user = user;
+            this.schedulingInfo = schedulingInfo;
+        }
+
+        public Builder jobJarFileLocation(URL jobJarFileLocation) {
+            this.jobJarFileLocation = jobJarFileLocation;
+            return this;
+        }
+
+        public Builder version(String version) {
+            this.version = version;
+            return this;
+        }
+
+        public Builder parameters(List<Parameter> parameters) {
+            this.parameters = parameters;
+            return this;
+        }
+
+        public Builder jobSla(JobSla jobSla) {
+            this.jobSla = jobSla;
+            return this;
+        }
+
+        public Builder subscriptionTimeoutSecs(long subscriptionTimeoutSecs) {
+            this.subscriptionTimeoutSecs = subscriptionTimeoutSecs;
+            return this;
+        }
+
+        public Builder deploymentStrategy(DeploymentStrategy deploymentStrategy) {
+            this.deploymentStrategy = deploymentStrategy;
+            return this;
+        }
+
+        public Builder slaMin(int slaMin) {
+            this.slaMin = slaMin;
+            return this;
+        }
+
+        public Builder slaMax(int slaMax) {
+            this.slaMax = slaMax;
+            return this;
+        }
+
+        public Builder cronSpec(String cronSpec) {
+            this.cronSpec = cronSpec;
+            return this;
+        }
+
+        public Builder cronPolicy(NamedJobDefinition.CronPolicy cronPolicy) {
+            this.cronPolicy = cronPolicy;
+            return this;
+        }
+
+        public Builder migrationConfig(WorkerMigrationConfig migrationConfig) {
+            this.migrationConfig = migrationConfig;
+            return this;
+        }
+
+        public Builder labels(List<Label> labels) {
+            this.labels = labels;
+            return this;
+        }
+
+        public MantisJobDefinition build() {
+            return new MantisJobDefinition(this);
+        }
     }
 
     public void validate(boolean schedulingInfoOptional) throws InvalidJobException {
@@ -169,6 +279,10 @@ public class MantisJobDefinition {
         return parameters;
     }
 
+    /**
+     * @deprecated jobSla is not applicable for job cluster creation requests and is ignored. Only used for job submission.
+     */
+    @Deprecated
     public JobSla getJobSla() {
         return jobSla;
     }
@@ -205,6 +319,10 @@ public class MantisJobDefinition {
         return cronPolicy;
     }
 
+    /**
+     * @deprecated isReadyForJobMaster is no longer used. Job master is determined by autoscaling configuration instead.
+     */
+    @Deprecated
     public boolean getIsReadyForJobMaster() {
         return isReadyForJobMaster;
     }

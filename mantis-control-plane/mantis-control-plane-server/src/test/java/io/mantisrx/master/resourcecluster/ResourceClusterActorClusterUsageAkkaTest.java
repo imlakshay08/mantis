@@ -17,7 +17,9 @@
 package io.mantisrx.master.resourcecluster;
 
 import static org.junit.Assert.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertThrows;
 
 import akka.actor.ActorRef;
@@ -35,9 +37,12 @@ import io.mantisrx.master.resourcecluster.proto.GetClusterUsageResponse;
 import io.mantisrx.master.resourcecluster.proto.GetClusterUsageResponse.UsageByGroupKey;
 import io.mantisrx.master.scheduler.CpuWeightedFitnessCalculator;
 import io.mantisrx.runtime.MachineDefinition;
+import io.mantisrx.runtime.MantisJobDurationType;
 import io.mantisrx.server.core.TestingRpcService;
 import io.mantisrx.server.core.domain.WorkerId;
 import io.mantisrx.server.core.scheduler.SchedulingConstraints;
+import io.mantisrx.server.master.ExecuteStageRequestFactory;
+import io.mantisrx.server.master.config.MasterConfiguration;
 import io.mantisrx.server.master.persistence.MantisJobStore;
 import io.mantisrx.server.master.resourcecluster.ClusterID;
 import io.mantisrx.server.master.resourcecluster.ContainerSkuID;
@@ -60,6 +65,7 @@ import java.util.HashSet;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import org.junit.AfterClass;
@@ -155,12 +161,15 @@ public class ResourceClusterActorClusterUsageAkkaTest {
     @Before
     public void setupRpcService() {
         rpcService.registerGateway(TASK_EXECUTOR_ADDRESS, gateway);
+        when(gateway.submitTask(any())).thenReturn(CompletableFuture.completedFuture(Ack.getInstance()));
         mantisJobStore = mock(MantisJobStore.class);
         jobMessageRouter = mock(JobMessageRouter.class);
     }
 
     @Before
     public void setupActor() throws Exception {
+        MasterConfiguration masterConfig = mock(MasterConfiguration.class);
+        ExecuteStageRequestFactory executeStageRequestFactory = new ExecuteStageRequestFactory(masterConfig);
         final Props props =
             ResourceClusterActor.props(
                 CLUSTER_ID,
@@ -177,7 +186,8 @@ public class ResourceClusterActorClusterUsageAkkaTest {
                 false,
                 ImmutableMap.of("jdk", "8"),
                 new CpuWeightedFitnessCalculator(),
-                null);
+                executeStageRequestFactory,
+                false);
 
         resourceClusterActor = actorSystem.actorOf(props);
         resourceCluster =
@@ -205,7 +215,7 @@ public class ResourceClusterActorClusterUsageAkkaTest {
         }
 
         // reserve jdk 17 TE and check usage
-        Set<TaskExecutorAllocationRequest> requests = Collections.singleton(TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0));
+        Set<TaskExecutorAllocationRequest> requests = Collections.singleton(TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual));
         assertEquals(
             TASK_EXECUTOR_ID_3,
             resourceCluster.getTaskExecutorsFor(requests).get().values().stream().findFirst().get());
@@ -226,9 +236,9 @@ public class ResourceClusterActorClusterUsageAkkaTest {
     public void testGetTaskExecutorsUsage_WithAllocationAttributesWithPendingJobSingleStage() throws Exception {
         // Requesting 3 workers but only 1 available and satisfying constraints --> add job to pending cache
         Set<TaskExecutorAllocationRequest> requests = ImmutableSet.of(
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0));
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual));
         assertThrows(ExecutionException.class, () -> resourceCluster.getTaskExecutorsFor(requests).get());
 
         // Test get cluster usage
@@ -249,9 +259,9 @@ public class ResourceClusterActorClusterUsageAkkaTest {
     public void testGetTaskExecutorsUsage_WithAllocationAttributesWithPendingJobMultiStageOnlyOneAvailable() throws Exception {
         // Requesting 3 workers: 1 small & 2 medium but only 1 small & 1 medium available and satisfying constraints --> add job to pending cache
         Set<TaskExecutorAllocationRequest> requests = ImmutableSet.of(
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, ImmutableMap.of("jdk", "17")), null, 0),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 1),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 1));
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual));
         assertThrows(ExecutionException.class, () -> resourceCluster.getTaskExecutorsFor(requests).get());
 
         // Test get cluster usage
@@ -331,9 +341,9 @@ public class ResourceClusterActorClusterUsageAkkaTest {
 
         // Requesting 3 workers with size name: 1 small & 2 large --> all available will decrement count as well
         Set<TaskExecutorAllocationRequest> requests = ImmutableSet.of(
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, Optional.of("small"), ImmutableMap.of("jdk", "17")), null, 0),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1));
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, Optional.of("small"), ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual));
         assertEquals(
             ImmutableSet.of("taskExecutorId4", "taskExecutorId5", "taskExecutorId6"),
             new HashSet<>(resourceCluster.getTaskExecutorsFor(requests).get().values().stream().map(TaskExecutorID::getResourceId).collect(Collectors.toList())));
@@ -359,10 +369,10 @@ public class ResourceClusterActorClusterUsageAkkaTest {
 
         // Requesting 3 workers with size name: 1 small & 3 large --> cannot find enough large available -> add to pending
         Set<TaskExecutorAllocationRequest> requests = ImmutableSet.of(
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, Optional.of("small"), ImmutableMap.of("jdk", "17")), null, 0),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1),
-            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-4"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1));
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-0-1"), SchedulingConstraints.of(MACHINE_DEFINITION_1, Optional.of("small"), ImmutableMap.of("jdk", "17")), null, 0, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-2"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-3"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual),
+            TaskExecutorAllocationRequest.of(WorkerId.fromIdUnsafe("late-sine-function-tutorial-1-worker-1-4"), SchedulingConstraints.of(MACHINE_DEFINITION_2, Optional.of("large"), ImmutableMap.of("jdk", "17")), null, 1, MantisJobDurationType.Perpetual));
         assertThrows(ExecutionException.class, () -> resourceCluster.getTaskExecutorsFor(requests).get());
 
         // Test get cluster usage

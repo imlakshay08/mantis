@@ -32,6 +32,8 @@ import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.Disable
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.EnableJobClusterRequest;
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.EnableJobClusterResponse;
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.GetJobClusterRequest;
+import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.HealthCheckRequest;
+import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.HealthCheckResponse;
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.GetJobClusterResponse;
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.GetJobDetailsResponse;
 import static io.mantisrx.master.jobcluster.proto.JobClusterManagerProto.GetJobSchedInfoRequest;
@@ -241,6 +243,7 @@ public class JobClustersManagerActor extends AbstractActorWithTimers implements 
                 .match(EnableJobClusterRequest.class, this::onJobClusterEnable)
                 .match(DisableJobClusterRequest.class, this::onJobClusterDisable)
                 .match(GetJobClusterRequest.class, this::onJobClusterGet)
+                .match(HealthCheckRequest.class, this::onHealthCheck)
                 .match(ListCompletedJobsInClusterRequest.class, this::onJobListCompleted)
                 .match(GetLastSubmittedJobIdStreamRequest.class, this::onGetLastSubmittedJobIdSubject)
                 .match(ListArchivedWorkersRequest.class, this::onListArchivedWorkers)
@@ -410,6 +413,23 @@ public class JobClustersManagerActor extends AbstractActorWithTimers implements 
                         }, () -> {
                             logger.info("JobClusterManagerActor transitioning to initialized behavior");
                             getContext().become(initializedBehavior);
+
+                            // Mark all reservation registries as ready.
+                            // This step is redundant in current setup as resource cluster actors won't be created till
+                            // the job cluster level init finish and there is nothing at this point of startup to send
+                            // markReady signal to. Consider whether to keep this logic as future-proof in case the
+                            // lifecycle between job clusters and resource clusters changed.
+                            if (mantisSchedulerFactory != null) {
+                                mantisSchedulerFactory.markAllRegistriesReady()
+                                    .whenComplete((ack, ex) -> {
+                                        if (ex != null) {
+                                            logger.error("Failed to mark reservation registries as ready", ex);
+                                        } else {
+                                            logger.info("All existing reservation registries marked ready");
+                                        }
+                                    });
+                            }
+
                             sender.tell(new JobClustersManagerInitializeResponse(initMsg.requestId, SUCCESS, "JobClustersManager successfully inited"), getSelf());
                         });
 
@@ -544,6 +564,7 @@ public class JobClustersManagerActor extends AbstractActorWithTimers implements 
             sender.tell(new GetJobClusterResponse(r.requestId, CLIENT_ERROR_NOT_FOUND, "No such Job cluster " + r.getJobClusterName(), empty()), getSelf());
         }
     }
+
     @Override
     public void onGetLastSubmittedJobIdSubject(GetLastSubmittedJobIdStreamRequest r) {
         Optional<JobClusterInfo> jobClusterInfo = jobClusterInfoManager.getJobClusterInfo(r.getClusterName());
@@ -645,6 +666,17 @@ public class JobClustersManagerActor extends AbstractActorWithTimers implements 
                     .message(String.format("JobCluster %s doesn't exist", request.getJobId().getCluster()))
                     .build(),
                 getSelf());
+        }
+    }
+
+    public void onHealthCheck(HealthCheckRequest request) {
+        Optional<JobClusterInfo> jobClusterInfo = jobClusterInfoManager.getJobClusterInfo(request.clusterName);
+
+        if (jobClusterInfo.isPresent()) {
+            jobClusterInfo.get().jobClusterActor.forward(request, getContext());
+        } else {
+            ActorRef sender = getSender();
+            sender.tell(new HealthCheckResponse(request.requestId, CLIENT_ERROR_NOT_FOUND, "No such Job cluster " + request.clusterName, false, null), getSelf());
         }
     }
 
